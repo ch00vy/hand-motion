@@ -1,0 +1,45 @@
+# Python/runtime
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments
+venv/
+.venv/
+env/
+
+# Local Codex/session metadata
+.codex/
+.agents/
+
+# Generated experiment outputs
+artifacts/
+reports/
+
+# Local capture/data folders
+records/
+dataset old/
+
+# External SDK/vendor drops kept locally only
+Ultraleap/
+leapc-python-bindings/
+
+# Local generated figures/exports
+proposal_figures/
+
+# Large model/checkpoint/data outputs
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.npy
+*.npz
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

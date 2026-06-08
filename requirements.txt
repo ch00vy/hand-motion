@@ -1,0 +1,14 @@
+numpy
+pandas
+scipy
+scikit-learn
+matplotlib
+networkx
+opencv-python
+pillow
+torch
+osqp
+mujoco
+gym
+myosuite
+neo4j
