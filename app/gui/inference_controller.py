@@ -11,6 +11,13 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 
+from app.affected_muscle_analysis import analyze_affected_muscles, write_affected_muscle_analysis_files
+from app.display_labels import (
+    SIMULATION_INTERPRETATION_NOTE,
+    display_label,
+    display_status,
+    status_description,
+)
 from app.gcn_node_classifier import GCNNodeClassifier, build_adjacency_matrix, build_node_feature_matrix
 from app.graph_sequence_baseline import compare_trial_to_reference, load_reference_sequence, load_trial_graph_sequence
 from app.gui.trial_loader import TrialData, write_result_files
@@ -23,22 +30,36 @@ DEFAULT_MODEL_PATH = Path(
         "HAND_TEMPORAL_GCN_MODEL_PATH",
         os.environ.get(
             "HAND_GCN_MODEL_PATH",
-            str(PROJECT_ROOT / "artifacts" / "temporal_gcn_prototype_dynamic" / "checkpoints" / "best_temporal_gcn.pt"),
+            str(
+                PROJECT_ROOT
+                / "artifacts"
+                / "dynamic_temporal_gcn_node_classifier_labeled_records"
+                / "checkpoints"
+                / "best_temporal_gcn.pt"
+            ),
         ),
     )
 )
 DEFAULT_REFERENCE_DIR = Path(
     os.environ.get(
         "HAND_REFERENCE_DIR",
-        str(PROJECT_ROOT / "artifacts" / "retrain_gui_plus_previous" / "reference_sequence" / "reference"),
+        str(PROJECT_ROOT / "artifacts" / "retrain_labeled_records" / "reference_sequence" / "reference"),
     )
 )
 DEFAULT_CANONICAL_DATASET_DIR = Path(
     os.environ.get(
         "HAND_CANONICAL_DATASET_DIR",
-        str(PROJECT_ROOT / "artifacts" / "retrain_gui_plus_previous" / "graph_sequence_dataset"),
+        str(PROJECT_ROOT / "artifacts" / "retrain_labeled_records" / "graph_sequence_dataset"),
     )
 )
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except Exception:
+        return float(default)
+    return value if np.isfinite(value) else float(default)
 
 
 @dataclass
@@ -53,6 +74,11 @@ class AnalysisConfig:
     # <=0 means the offline biomech backend processes every recorded frame.
     # The graph sequence is still progress-normalized to sequence_length later.
     max_frames_per_trial: int = 0
+    threshold_deviating: float = _env_float("HAND_DEVIATING_THRESHOLD", 0.99)
+    threshold_affected: float = _env_float("HAND_AFFECTED_THRESHOLD", 0.60)
+    prediction_deviating_threshold: float = _env_float("HAND_PREDICT_DEVIATING_THRESHOLD", 0.99)
+    edge_aggregation_method: str = "mean"
+    top_k_affected: int = 0
     python_executable: str = sys.executable
 
 
@@ -68,6 +94,7 @@ class BinaryGCNInferenceController:
         self.config = config or AnalysisConfig()
 
     def run_trial_analysis(self, trial: TrialData) -> dict[str, Any]:
+        self._validate_required_artifacts()
         analysis_dir = trial.trial_dir / "analysis" / str(self.config.analysis_subdir)
         analysis_dir.mkdir(parents=True, exist_ok=True)
         input_csv = self._write_biomech_input_csv(trial, analysis_dir / "input")
@@ -95,6 +122,11 @@ class BinaryGCNInferenceController:
             "graph_sequence_dir": str(graph_dir),
             "graph_json": str(graph_json),
         }
+        affected = result.get("affected_muscle_analysis")
+        if affected:
+            affected_csv, affected_json = write_affected_muscle_analysis_files(trial.trial_dir, affected)
+            result["artifact_paths"]["affected_muscle_csv"] = str(affected_csv)
+            result["artifact_paths"]["affected_muscle_summary_json"] = str(affected_json)
         result_json, result_csv = write_result_files(trial, result)
         result["artifact_paths"]["result_json"] = str(result_json)
         result["artifact_paths"]["result_csv"] = str(result_csv)
@@ -203,12 +235,15 @@ class BinaryGCNInferenceController:
         trial_id = str(trial.trial_id)
         motion_type = str(trial.motion_type)
         subject_id = str(trial.meta.get("subject_id") or "")
+        trial_label = str(trial.meta.get("trial_label") or trial.meta.get("label") or "normal")
         data: dict[str, Any] = {
             "frame_index": np.arange(frame_count, dtype=int),
             "frame": np.arange(frame_count, dtype=int),
             "t": np.arange(frame_count, dtype=float) * dt,
             "session_id": [subject_id] * frame_count,
             "subject_id": [subject_id] * frame_count,
+            "trial_label": [trial_label] * frame_count,
+            "label": [trial_label] * frame_count,
             "trial_id": [trial_id] * frame_count,
             "exercise_name": [motion_type] * frame_count,
             "motion_type": [motion_type] * frame_count,
@@ -300,6 +335,36 @@ class BinaryGCNInferenceController:
             "0.35",
             "--activation-preemphasis-alphas",
             "0.25,0.5,1.0",
+            "--state-feedback-refine-iters",
+            "1",
+            "--state-feedback-kp",
+            "0.35",
+            "--state-feedback-kv",
+            "0.006",
+            "--state-feedback-tau-clip",
+            "0.35",
+            "--state-feedback-gains",
+            "0.25,0.5,1.0",
+            "--ctrl-timing-refine-iters",
+            "1",
+            "--ctrl-timing-lead-frames",
+            "1,2,3",
+            "--ctrl-timing-blend-alphas",
+            "0.25,0.5,0.75",
+            "--ctrl-timing-preemphasis-gains",
+            "0.2,0.3,0.45,0.6",
+            "--ctrl-timing-objective-tolerance",
+            "0.03",
+            "--ctrl-replay-boost-iters",
+            "2",
+            "--ctrl-replay-boost-gains",
+            "0.05,0.1,0.2,0.35",
+            "--ctrl-replay-extensor-relief-gain",
+            "0.10",
+            "--validation-initial-act-mode",
+            "ctrl0",
+            "--rollout-initial-act-mode",
+            "ctrl0",
             "--horizon-size",
             "4",
             "--horizon-iters",
@@ -312,6 +377,8 @@ class BinaryGCNInferenceController:
             "0.05",
             "--rollout-final-qpos-weight",
             "4.0",
+            "--rollout-mismatch-feedback-gain",
+            "1.0",
             "--rollout-u-weight",
             "0.005",
             "--rollout-delta-u-weight",
@@ -372,6 +439,26 @@ class BinaryGCNInferenceController:
         ]
         self._run_command(args, cwd=PROJECT_ROOT, log_path=output_dir / "build_graph_sequence.log")
 
+    def _validate_required_artifacts(self) -> None:
+        model_path = Path(self.config.model_path)
+        reference_dir = Path(self.config.reference_dir)
+        if not model_path.exists():
+            raise FileNotFoundError(
+                "Model checkpoint final tidak ditemukan.\n\n"
+                f"Expected:\n{model_path}\n\n"
+                "Copy artifact ini dari device lama/backup:\n"
+                "artifacts/dynamic_temporal_gcn_node_classifier_labeled_records/checkpoints/best_temporal_gcn.pt\n\n"
+                "Jika model ada di lokasi lain, set HAND_TEMPORAL_GCN_MODEL_PATH ke path file .pt tersebut."
+            )
+        if not reference_dir.exists():
+            raise FileNotFoundError(
+                "Reference sequence final tidak ditemukan.\n\n"
+                f"Expected:\n{reference_dir}\n\n"
+                "Copy folder ini dari device lama/backup:\n"
+                "artifacts/retrain_labeled_records/reference_sequence/reference\n\n"
+                "Jika reference ada di lokasi lain, set HAND_REFERENCE_DIR ke folder reference tersebut."
+            )
+
     def _infer_graph(self, *, graph_json: Path, trial: TrialData) -> dict[str, Any]:
         import torch
 
@@ -394,6 +481,13 @@ class BinaryGCNInferenceController:
             x, feature_names, summary_df = build_node_feature_matrix(graph_trial, comparison)
             feature_mean = np.asarray(checkpoint["feature_mean"], dtype=np.float32)
             feature_std = np.asarray(checkpoint["feature_std"], dtype=np.float32)
+            if int(np.asarray(x).shape[1]) != int(feature_mean.shape[0]):
+                feature_mode = str((graph_trial.get("metadata") or {}).get("node_feature_mode") or "unknown")
+                raise ValueError(
+                    f"Graph feature dimension {int(np.asarray(x).shape[1])} does not match checkpoint dimension "
+                    f"{int(feature_mean.shape[0])}. node_feature_mode={feature_mode}. "
+                    "Use a checkpoint trained with the same node feature contract."
+                )
             x_std = (np.asarray(x, dtype=np.float32) - feature_mean) / np.where(feature_std > 1e-8, feature_std, 1.0)
             adjacency = build_adjacency_matrix(graph_trial)
             model = GCNNodeClassifier(
@@ -411,25 +505,68 @@ class BinaryGCNInferenceController:
         pred_idx = np.argmax(probabilities, axis=1)
         node_rows: list[dict[str, Any]] = []
         summary_rows = summary_df.sort_values("node_index").reset_index(drop=True).to_dict(orient="records")
+        has_deviating_class = "deviating" in class_names
+        deviating_class_idx = class_names.index("deviating") if has_deviating_class else -1
         for idx, node_name in enumerate(list(graph_trial["node_names"])):
             row = dict(summary_rows[idx]) if idx < len(summary_rows) else {}
-            label = class_names[int(pred_idx[idx])]
-            deviating_idx = class_names.index("deviating") if "deviating" in class_names else int(pred_idx[idx])
+            raw_label = class_names[int(pred_idx[idx])]
+            deviating_idx = deviating_class_idx if has_deviating_class else int(pred_idx[idx])
+            probability_deviating = float(probabilities[idx, deviating_idx])
+            if has_deviating_class:
+                label = "deviating" if probability_deviating >= float(self.config.prediction_deviating_threshold) else "within_reference"
+            else:
+                label = raw_label
+            decision_status = "accepted"
+            if has_deviating_class and raw_label == "deviating" and label != "deviating":
+                decision_status = "borderline_below_threshold"
             node_rows.append(
                 {
                     "node_index": int(idx),
                     "node_name": str(node_name),
                     "predicted_label": label,
+                    "display_predicted_label": display_label(label),
+                    "raw_predicted_label": raw_label,
                     "probability_within_reference": float(probabilities[idx, 0]) if probabilities.shape[1] > 0 else 0.0,
-                    "probability_deviating": float(probabilities[idx, deviating_idx]),
+                    "probability_deviating": probability_deviating,
                     "confidence": float(np.max(probabilities[idx])),
+                    "decision_status": decision_status,
+                    "decision_threshold_deviating": float(self.config.prediction_deviating_threshold),
                     "deviation_score": float(row.get("average_deviation_score", 0.0)),
                     "onset_status": str(row.get("onset_status", "")),
                     "magnitude_status": str(row.get("magnitude_status", "")),
                     "smoothness_status": str(row.get("smoothness_status", "")),
                 }
             )
-        node_rows.sort(key=lambda item: (item["predicted_label"] != "deviating", -float(item["probability_deviating"]), -float(item["deviation_score"])))
+        affected_analysis = analyze_affected_muscles(
+            graph_trial=graph_trial,
+            node_results=node_rows,
+            threshold_deviating=float(self.config.threshold_deviating),
+            threshold_affected=float(self.config.threshold_affected),
+            edge_aggregation_method=str(self.config.edge_aggregation_method),
+            top_k_affected=int(self.config.top_k_affected),
+        )
+        affected_by_name = {str(row["muscle_name"]): dict(row) for row in list(affected_analysis.get("rows") or [])}
+        for row in node_rows:
+            affected_row = affected_by_name.get(str(row.get("node_name") or ""))
+            if not affected_row:
+                continue
+            row["affected_final_status"] = str(affected_row.get("final_status") or "")
+            row["display_final_status"] = str(affected_row.get("display_status") or display_status(row["affected_final_status"]))
+            row["display_label"] = str(affected_row.get("display_label") or display_status(row["affected_final_status"]))
+            row["status_description"] = str(affected_row.get("status_description") or status_description(row["affected_final_status"]))
+            row["relational_risk"] = float(affected_row.get("relational_risk") or 0.0)
+            row["strongest_related_deviating_muscle"] = str(affected_row.get("strongest_related_deviating_muscle") or "")
+            row["affected_explanation"] = str(affected_row.get("explanation") or "")
+
+        status_rank = {"terindikasi_menyimpang": 0, "berpotensi_terdampak": 1, "sesuai_acuan": 2}
+        node_rows.sort(
+            key=lambda item: (
+                status_rank.get(str(item.get("affected_final_status") or ""), 3),
+                -float(item.get("probability_deviating", 0.0)),
+                -float(item.get("relational_risk", 0.0)),
+                -float(item.get("deviation_score", 0.0)),
+            )
+        )
         deviating = [row for row in node_rows if row["predicted_label"] == "deviating"]
         node_deviation_df = comparison.get("node_deviation_df")
         node_progress_deviation: list[dict[str, Any]] = []
@@ -447,6 +584,7 @@ class BinaryGCNInferenceController:
         return {
             "trial_id": str(trial.trial_id),
             "subject_id": str(trial.meta.get("subject_id") or ""),
+            "trial_label": str(trial.meta.get("trial_label") or trial.meta.get("label") or "normal"),
             "motion_type": str(trial.motion_type),
             "model_path": str(self.config.model_path),
             "model_family": model_family,
@@ -456,13 +594,23 @@ class BinaryGCNInferenceController:
                 "num_nodes": int(len(node_rows)),
                 "num_deviating": int(len(deviating)),
                 "num_within_reference": int(len(node_rows) - len(deviating)),
+                "num_affected": int((affected_analysis.get("summary") or {}).get("affected_muscles", 0)),
                 "top_deviating_nodes": [row["node_name"] for row in deviating[:10]],
+                "top_affected_muscles": list((affected_analysis.get("summary") or {}).get("top_affected_muscles") or []),
                 "overall_node_deviation_score": float(comparison["summary"].get("overall_node_deviation_score", 0.0)),
                 "overall_edge_deviation_score": float(comparison["summary"].get("overall_edge_deviation_score", 0.0)),
                 "highest_deviation_region": worst_region,
+                "prediction_deviating_threshold": float(self.config.prediction_deviating_threshold),
+                "threshold_deviating": float(self.config.threshold_deviating),
+                "threshold_affected": float(self.config.threshold_affected),
+                "display_num_deviating_label": "Pola Aktivitas Berbeda",
+                "display_num_within_reference_label": "Sesuai Pola Acuan",
+                "display_num_affected_label": "Otot Terkait Secara Relasional",
+                "interpretation_note": SIMULATION_INTERPRETATION_NOTE,
             },
             "nodes": node_rows,
             "node_progress_deviation": node_progress_deviation,
+            "affected_muscle_analysis": affected_analysis,
         }
 
     def _align_to_canonical_template(self, trial: dict[str, Any]) -> dict[str, Any]:
@@ -479,7 +627,10 @@ class BinaryGCNInferenceController:
         manifest_df = pd.read_csv(manifest_path)
         if manifest_df.empty or "json_path" not in manifest_df.columns:
             return trial
-        canonical = load_trial_graph_sequence(Path(str(manifest_df.iloc[0]["json_path"])))
+        canonical_json = self._resolve_manifest_json_path(manifest_df.iloc[0]["json_path"], base_dir=Path(self.config.canonical_dataset_dir))
+        if canonical_json is None:
+            return trial
+        canonical = load_trial_graph_sequence(canonical_json)
         canonical_edges = list(canonical.get("edges") or [])
         trial_edges = list(trial.get("edges") or [])
         if len(canonical_edges) == len(trial_edges):
@@ -515,3 +666,19 @@ class BinaryGCNInferenceController:
                     out[:, new_idx] = arr[:, old_idx]
             aligned[key] = out
         return aligned
+
+    @staticmethod
+    def _resolve_manifest_json_path(value: Any, *, base_dir: Path) -> Optional[Path]:
+        raw = str(value or "").strip()
+        candidates: list[Path] = []
+        if raw:
+            original = Path(raw)
+            candidates.append(original)
+            if not original.is_absolute():
+                candidates.append(Path(base_dir) / original)
+            candidates.append(Path(base_dir) / original.name)
+        candidates.extend(sorted(Path(base_dir).glob("*.json")))
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None

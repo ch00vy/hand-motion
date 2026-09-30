@@ -37,6 +37,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera", choices=("left", "right"), default="right", help="IR camera image to display.")
     parser.add_argument("--scale", type=float, default=1.6, help="Display scale multiplier.")
     parser.add_argument("--window-name", default="Ultraleap IR + Skeleton", help="OpenCV window title.")
+    parser.add_argument("--window-x", type=int, default=None)
+    parser.add_argument("--window-y", type=int, default=None)
+    parser.add_argument("--window-width", type=int, default=600)
+    parser.add_argument("--window-height", type=int, default=450)
     parser.add_argument("--show-image", action="store_true", help="Show IR image behind the skeleton. Default is skeleton-only.")
     parser.add_argument("--projection-mode", choices=PROJECTION_MODES, default="inverse_neg_y", help="Camera matrix/ray projection variant to audit.")
     parser.add_argument("--flip-x", action="store_true", help="Flip projected skeleton horizontally after calibration projection.")
@@ -145,6 +149,10 @@ def main() -> int:
 
     window_name = str(args.window_name)
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    cv2.resizeWindow(window_name, int(args.window_width), int(args.window_height))
+    if args.window_x is not None and args.window_y is not None:
+        cv2.moveWindow(window_name, int(args.window_x), int(args.window_y))
+    cv2.waitKey(1)
     last_status = 0.0
     try:
         while True:

@@ -274,6 +274,25 @@ def set_full_state(model: Any, data: Any, qpos: np.ndarray, qvel: np.ndarray, qa
     mujoco.mj_forward(m_raw, d_raw)
 
 
+def set_initial_act_from_ctrl(model: Any, data: Any, ctrl: np.ndarray | None) -> None:
+    """Initialize muscle activation state from the first control frame.
+
+    MuJoCo/MyoSuite muscle controls pass through activation dynamics. Starting a
+    control replay with zero activation can make an otherwise valid ctrl_ref look
+    artificially weak at the beginning of a recorded transition.
+    """
+
+    if ctrl is None or int(getattr(model, "na", 0)) <= 0 or not hasattr(data, "act"):
+        return
+    ctrl_in = np.asarray(ctrl, dtype=float).reshape(-1)
+    if ctrl_in.size == 0:
+        return
+    n = min(int(len(data.act)), int(ctrl_in.shape[0]))
+    if n <= 0:
+        return
+    data.act[:n] = np.clip(np.where(np.isfinite(ctrl_in[:n]), ctrl_in[:n], 0.0), 0.0, 1.0)
+
+
 def compute_inverse_dynamics_tau(
     model: Any,
     data: Any,
@@ -524,6 +543,7 @@ def forward_validate_sequence(
     *,
     max_substeps: int,
     validation_window_size: int,
+    initial_act_mode: str = "zero",
 ) -> dict[str, Any]:
     m_raw, _ = _get_raw_model_data(model, model.data if hasattr(model, "data") else None) if hasattr(model, "data") else (model, None)
     d_val = mujoco.MjData(m_raw)
@@ -533,6 +553,7 @@ def forward_validate_sequence(
     dt_seq = np.asarray(dt_seq, dtype=float)
     if qpos_target_seq.shape[0] <= 1:
         return {
+            "initial_act_mode": str(initial_act_mode),
             "mean_joint_error": 0.0,
             "rmse_forward_error": 0.0,
             "mean_pose_error_norm": 0.0,
@@ -549,7 +570,11 @@ def forward_validate_sequence(
             "per_window_rmse": [],
         }
 
+    initial_act_mode = str(initial_act_mode or "zero").strip().lower()
     set_full_state(m_raw, d_val, qpos_target_seq[0], qvel_target_seq[0], np.zeros(int(m_raw.nv), dtype=float), ctrl=ctrl_seq[0], zero_act=True)
+    if initial_act_mode in {"ctrl0", "first_ctrl"}:
+        set_initial_act_from_ctrl(m_raw, d_val, ctrl_seq[0] if ctrl_seq.shape[0] else None)
+        mujoco.mj_forward(m_raw, d_val)
     substeps = build_substeps_from_dt(dt_seq, float(m_raw.opt.timestep), max_substeps)
     frame_errors: list[float] = [0.0]
     per_joint_sqerr = np.zeros(int(m_raw.nq), dtype=float)
@@ -578,6 +603,7 @@ def forward_validate_sequence(
     per_joint_rmse = np.sqrt(np.divide(per_joint_sqerr, np.maximum(per_joint_count, 1.0), out=np.zeros_like(per_joint_sqerr), where=per_joint_count > 0))
     window_rmses = compute_window_rmse(frame_error_arr, validation_window_size)
     return {
+        "initial_act_mode": initial_act_mode,
         "mean_joint_error": mean_joint_error,
         "rmse_forward_error": rmse_forward_error,
         "mean_pose_error_norm": float(np.mean(frame_error_arr)) if frame_error_arr.size else 0.0,

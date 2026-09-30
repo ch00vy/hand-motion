@@ -18,12 +18,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--show-external-leap-skeleton",
         action="store_true",
-        help="Compatibility flag. The external Leap viewer now opens by default.",
+        help="Automatically open the external Leap viewer at GUI startup.",
     )
     parser.add_argument(
         "--no-auto-open-leap-viewer",
         action="store_true",
-        help="Do not automatically open the external Leap viewer at GUI startup.",
+        help="Compatibility flag. The external Leap viewer is already disabled by default.",
     )
     return parser.parse_args()
 
@@ -33,7 +33,7 @@ def main() -> int:
     if bool(args.smoke_test):
         print(json.dumps(smoke_test(), indent=2))
         return 0
-    gui_main(show_external_leap_skeleton=not bool(args.no_auto_open_leap_viewer))
+    gui_main(show_external_leap_skeleton=bool(args.show_external_leap_skeleton))
     return 0
 
 

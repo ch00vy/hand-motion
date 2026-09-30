@@ -8,6 +8,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from app.estimation import RealtimePDDynamicCtrlEstimator, map_qspace_signal_to_actuator_indicators, qpos_motion_scores
+from app.estimation.effort_normalizer import normalize_abs_indicator
 from app.realtime.monolithic_runtime_backend import (  # noqa: E402
     DEFAULT_MYOSUITE_ENV_ID,
     FALLBACK_MUSCLE_NAMES,
@@ -18,7 +20,17 @@ from app.realtime.monolithic_runtime_backend import (  # noqa: E402
 EPS = 1e-8
 DEFAULT_ONSET_RATIO = 0.20
 DEFAULT_TIME_REGION_WIDTH = 3
-NODE_FEATURE_NAMES = ("mean_ctrl", "std_ctrl", "max_ctrl", "delta_ctrl", "auc_ctrl")
+LEGACY_NODE_FEATURE_NAMES = ("mean_ctrl", "std_ctrl", "max_ctrl", "delta_ctrl", "auc_ctrl")
+WEAKNESS_FUSION_NODE_FEATURE_NAMES = (
+    "pd_ctrl_indicator",
+    "id_effort_indicator",
+    "ROM_score",
+    "velocity_score",
+    "completion_score",
+    "delay_score",
+)
+NODE_FEATURE_NAMES = LEGACY_NODE_FEATURE_NAMES
+VALID_NODE_FEATURE_MODES = ("legacy_ctrl", "weakness_fusion")
 
 
 def dataframe_to_markdown_simple(df: pd.DataFrame) -> str:
@@ -55,6 +67,20 @@ def _indexed_columns(df: pd.DataFrame, prefix: str) -> list[str]:
     return [label for _, label in cols]
 
 
+def _first_indexed_columns(df: pd.DataFrame, prefixes: tuple[str, ...]) -> tuple[list[str], str]:
+    for prefix in prefixes:
+        cols = _indexed_columns(df, prefix)
+        if cols:
+            return cols, prefix
+    return [], ""
+
+
+def _numeric_matrix(df: pd.DataFrame, cols: list[str]) -> np.ndarray:
+    if not cols:
+        return np.zeros((len(df), 0), dtype=np.float32)
+    return df[cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+
+
 def discover_recording_csvs(root: Path) -> list[Path]:
     root = Path(root).resolve()
     if root.is_file():
@@ -82,21 +108,21 @@ def load_recording_trial(path: Path, *, source_root: Path | None = None) -> dict
     if df.empty:
         raise ValueError(f"Empty recording CSV: {csv_path}")
 
-    ctrl_cols: list[str] = []
-    for prefix in ("ctrl_ref_", "ctrl_teacher_", "ctrl_target_", "ctrl_analysis_", "ctrl_"):
-        ctrl_cols = _indexed_columns(df, prefix)
-        if ctrl_cols:
-            break
-    qpos_cols = _indexed_columns(df, "qpos_")
+    ctrl_cols, ctrl_prefix = _first_indexed_columns(df, ("ctrl_ref_", "ctrl_teacher_", "ctrl_target_", "ctrl_analysis_", "ctrl_"))
+    qpos_cols, qpos_prefix = _first_indexed_columns(df, ("qpos_target_", "qpos_", "qpos_raw_"))
+    qpos_raw_cols, qpos_raw_prefix = _first_indexed_columns(df, ("qpos_raw_", "qpos_", "qpos_target_"))
+    qvel_cols, qvel_prefix = _first_indexed_columns(df, ("qvel_traj_", "qvel_target_", "qvel_current_", "qvel_"))
+    qacc_cols, qacc_prefix = _first_indexed_columns(df, ("qacc_traj_", "qacc_target_", "qacc_des_", "qacc_"))
+    qfrc_cols, qfrc_prefix = _first_indexed_columns(df, ("qfrc_inverse_",))
     if not ctrl_cols:
         raise ValueError(f"No ctrl columns found in {csv_path}")
 
-    ctrl = df[ctrl_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-    qpos = (
-        df[qpos_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-        if qpos_cols
-        else np.zeros((len(df), 0), dtype=np.float32)
-    )
+    ctrl = _numeric_matrix(df, ctrl_cols)
+    qpos = _numeric_matrix(df, qpos_cols)
+    qpos_raw = _numeric_matrix(df, qpos_raw_cols)
+    qvel = _numeric_matrix(df, qvel_cols)
+    qacc = _numeric_matrix(df, qacc_cols)
+    qfrc_inverse = _numeric_matrix(df, qfrc_cols)
     timestamps = (
         pd.to_numeric(df["t"], errors="coerce").ffill().bfill().to_numpy(dtype=np.float64)
         if "t" in df.columns
@@ -126,9 +152,23 @@ def load_recording_trial(path: Path, *, source_root: Path | None = None) -> dict
         "num_frames": int(len(df)),
         "ctrl": ctrl,
         "qpos": qpos,
+        "qpos_raw": qpos_raw,
+        "qvel": qvel,
+        "qacc": qacc,
+        "qfrc_inverse": qfrc_inverse,
         "timestamps": timestamps,
         "ctrl_columns": ctrl_cols,
+        "ctrl_column_prefix": ctrl_prefix,
         "qpos_columns": qpos_cols,
+        "qpos_column_prefix": qpos_prefix,
+        "qpos_raw_columns": qpos_raw_cols,
+        "qpos_raw_column_prefix": qpos_raw_prefix,
+        "qvel_columns": qvel_cols,
+        "qvel_column_prefix": qvel_prefix,
+        "qacc_columns": qacc_cols,
+        "qacc_column_prefix": qacc_prefix,
+        "qfrc_inverse_columns": qfrc_cols,
+        "qfrc_inverse_column_prefix": qfrc_prefix,
     }
 
 
@@ -229,6 +269,10 @@ def detect_transition_segment(
         **trial,
         "ctrl": ctrl[start_frame : end_frame + 1].copy(),
         "qpos": qpos[start_frame : end_frame + 1].copy(),
+        "qpos_raw": np.asarray(trial.get("qpos_raw", np.zeros((num_frames, 0))), dtype=np.float32)[start_frame : end_frame + 1].copy(),
+        "qvel": np.asarray(trial.get("qvel", np.zeros((num_frames, 0))), dtype=np.float32)[start_frame : end_frame + 1].copy(),
+        "qacc": np.asarray(trial.get("qacc", np.zeros((num_frames, 0))), dtype=np.float32)[start_frame : end_frame + 1].copy(),
+        "qfrc_inverse": np.asarray(trial.get("qfrc_inverse", np.zeros((num_frames, 0))), dtype=np.float32)[start_frame : end_frame + 1].copy(),
         "timestamps": np.asarray(trial["timestamps"], dtype=np.float64)[start_frame : end_frame + 1].copy(),
         "num_frames": int(end_frame - start_frame + 1),
         "segment_start_frame": int(start_frame),
@@ -302,8 +346,92 @@ def build_window_node_features(ctrl_window: np.ndarray) -> np.ndarray:
     std_ctrl = np.std(window, axis=0)
     max_ctrl = np.max(window, axis=0)
     delta_ctrl = window[-1] - window[0]
-    auc_ctrl = np.trapz(window, dx=1.0 / max(1, window.shape[0] - 1), axis=0)
+    # NumPy 2.4 removed the legacy ``trapz`` alias.  Keep compatibility with
+    # environments still using NumPy 1.x as well.
+    integrate = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    auc_ctrl = integrate(window, dx=1.0 / max(1, window.shape[0] - 1), axis=0)
     return np.stack((mean_ctrl, std_ctrl, max_ctrl, delta_ctrl, auc_ctrl), axis=1).astype(np.float32)
+
+
+def resolve_node_feature_names(node_feature_mode: str) -> tuple[str, tuple[str, ...]]:
+    mode = str(node_feature_mode or "legacy_ctrl").strip().lower()
+    if mode not in VALID_NODE_FEATURE_MODES:
+        mode = "legacy_ctrl"
+    if mode == "weakness_fusion":
+        return mode, WEAKNESS_FUSION_NODE_FEATURE_NAMES
+    return mode, LEGACY_NODE_FEATURE_NAMES
+
+
+def _resample_optional_matrix(trial: dict[str, Any], key: str, sequence_length: int, fallback: np.ndarray) -> np.ndarray:
+    arr = np.asarray(trial.get(key, np.zeros((0, 0), dtype=np.float32)), dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] == 0:
+        arr = np.asarray(fallback, dtype=np.float32)
+    if arr.ndim != 2:
+        arr = np.zeros((int(sequence_length), 0), dtype=np.float32)
+    return _resample_array(arr, sequence_length) if arr.size else np.zeros((int(sequence_length), 0), dtype=np.float32)
+
+
+def _project_qspace_sequence_to_nodes(signal_seq: np.ndarray, node_names: list[str]) -> np.ndarray:
+    signal = np.asarray(signal_seq, dtype=np.float32)
+    if signal.ndim != 2 or signal.shape[0] == 0 or signal.shape[1] == 0:
+        return np.zeros((signal.shape[0] if signal.ndim == 2 else 0, len(node_names)), dtype=np.float32)
+    rows = [
+        map_qspace_signal_to_actuator_indicators(row, actuator_names=node_names)
+        for row in signal
+    ]
+    return np.asarray(rows, dtype=np.float32)
+
+
+def _build_pd_indicator_sequence(
+    *,
+    qpos_target: np.ndarray,
+    qpos_current: np.ndarray,
+    qvel_target: np.ndarray,
+    node_names: list[str],
+) -> np.ndarray:
+    if qpos_target.ndim != 2 or qpos_target.shape[0] == 0 or qpos_target.shape[1] == 0:
+        return np.zeros((qpos_target.shape[0] if qpos_target.ndim == 2 else 0, len(node_names)), dtype=np.float32)
+    estimator = RealtimePDDynamicCtrlEstimator(actuator_names=node_names)
+    rows = []
+    for idx in range(qpos_target.shape[0]):
+        current = qpos_current[idx] if qpos_current.ndim == 2 and idx < qpos_current.shape[0] and qpos_current.shape[1] else qpos_target[idx]
+        qvel = qvel_target[idx] if qvel_target.ndim == 2 and idx < qvel_target.shape[0] and qvel_target.shape[1] else None
+        ctrl, _info = estimator.estimate(q_target=qpos_target[idx], qpos_current=current, qvel_target=qvel, dt_override=1.0 / 60.0)
+        rows.append(ctrl)
+    return np.asarray(rows, dtype=np.float32)
+
+
+def _build_motion_score_nodes(qpos_resampled: np.ndarray, node_names: list[str]) -> dict[str, np.ndarray]:
+    target = qpos_resampled[-1] if qpos_resampled.ndim == 2 and qpos_resampled.shape[0] else None
+    scores = qpos_motion_scores(qpos_resampled, target_qpos=target)
+    return {
+        key: map_qspace_signal_to_actuator_indicators(values, actuator_names=node_names)
+        for key, values in scores.items()
+    }
+
+
+def build_window_weakness_fusion_features(
+    *,
+    pd_indicator_window: np.ndarray,
+    id_effort_window: np.ndarray,
+    motion_score_nodes: dict[str, np.ndarray],
+) -> np.ndarray:
+    pd_window = np.asarray(pd_indicator_window, dtype=np.float32)
+    id_window = np.asarray(id_effort_window, dtype=np.float32)
+    num_nodes = int(pd_window.shape[1]) if pd_window.ndim == 2 else int(id_window.shape[1])
+    pd_mean = np.mean(pd_window, axis=0) if pd_window.size else np.zeros((num_nodes,), dtype=np.float32)
+    id_mean = np.mean(id_window, axis=0) if id_window.size else np.zeros((num_nodes,), dtype=np.float32)
+    return np.stack(
+        (
+            pd_mean,
+            id_mean,
+            np.asarray(motion_score_nodes.get("rom_score", np.zeros(num_nodes)), dtype=np.float32),
+            np.asarray(motion_score_nodes.get("velocity_score", np.zeros(num_nodes)), dtype=np.float32),
+            np.asarray(motion_score_nodes.get("completion_score", np.zeros(num_nodes)), dtype=np.float32),
+            np.asarray(motion_score_nodes.get("delay_score", np.zeros(num_nodes)), dtype=np.float32),
+        ),
+        axis=1,
+    ).astype(np.float32)
 
 
 def build_window_edge_weights(
@@ -354,9 +482,12 @@ def build_trial_graph_sequence(
     edge_threshold: float,
     include_edge_sign: bool,
     cohort: str,
+    node_feature_mode: str = "legacy_ctrl",
 ) -> dict[str, Any]:
     ctrl = np.asarray(trial["ctrl"], dtype=np.float32)
     qpos = np.asarray(trial["qpos"], dtype=np.float32)
+    node_names = [str(name) for name in list(graph_template["node_names"])]
+    resolved_node_feature_mode, node_feature_names = resolve_node_feature_names(node_feature_mode)
     sequence_length = max(1, int(sequence_length))
     window_size = max(1, int(window_size))
     window_stride = max(1, int(window_stride))
@@ -366,7 +497,33 @@ def build_trial_graph_sequence(
 
     ctrl_resampled = _resample_array(ctrl, sequence_length)
     qpos_resampled = _resample_array(qpos, sequence_length) if qpos.size else np.zeros((sequence_length, 0), dtype=np.float32)
+    qpos_raw_resampled = _resample_optional_matrix(trial, "qpos_raw", sequence_length, qpos_resampled)
+    qvel_resampled = _resample_optional_matrix(trial, "qvel", sequence_length, np.zeros_like(qpos_resampled))
+    qfrc_inverse_resampled = _resample_optional_matrix(trial, "qfrc_inverse", sequence_length, np.zeros_like(qpos_resampled))
     progress_steps = np.linspace(0.0, 100.0, sequence_length, dtype=np.float32)
+
+    pd_indicator_seq = np.zeros((sequence_length, len(node_names)), dtype=np.float32)
+    id_effort_indicator_seq = np.zeros((sequence_length, len(node_names)), dtype=np.float32)
+    motion_score_nodes: dict[str, np.ndarray] = {}
+    edge_signal_resampled = ctrl_resampled
+    if resolved_node_feature_mode == "weakness_fusion":
+        pd_indicator_seq = _build_pd_indicator_sequence(
+            qpos_target=qpos_resampled,
+            qpos_current=qpos_raw_resampled,
+            qvel_target=qvel_resampled,
+            node_names=node_names,
+        )
+        if qfrc_inverse_resampled.size:
+            abs_tau = np.abs(qfrc_inverse_resampled.reshape(-1))
+            positive_tau = abs_tau[abs_tau > EPS]
+            tau_scale = float(np.percentile(positive_tau, 95.0)) if positive_tau.size else 1.0
+            id_joint_indicator = np.asarray(
+                [normalize_abs_indicator(row, scale=tau_scale) for row in qfrc_inverse_resampled],
+                dtype=np.float32,
+            )
+            id_effort_indicator_seq = _project_qspace_sequence_to_nodes(id_joint_indicator, node_names)
+        motion_score_nodes = _build_motion_score_nodes(qpos_resampled, node_names)
+        edge_signal_resampled = pd_indicator_seq
 
     if window_size > sequence_length:
         window_size = sequence_length
@@ -374,7 +531,7 @@ def build_trial_graph_sequence(
     if starts[-1] != sequence_length - window_size:
         starts.append(sequence_length - window_size)
 
-    node_feature_seq = np.zeros((len(starts), ctrl_resampled.shape[1], len(NODE_FEATURE_NAMES)), dtype=np.float32)
+    node_feature_seq = np.zeros((len(starts), len(node_names), len(node_feature_names)), dtype=np.float32)
     edge_weight_raw_seq = np.zeros((len(starts), len(graph_template["edges"])), dtype=np.float32)
     edge_active_seq = np.zeros((len(starts), len(graph_template["edges"])), dtype=np.int8)
     edge_weight_seq = np.zeros((len(starts), len(graph_template["edges"])), dtype=np.float32)
@@ -385,9 +542,17 @@ def build_trial_graph_sequence(
     for window_idx, start_idx in enumerate(starts):
         stop_idx = start_idx + window_size
         ctrl_window = ctrl_resampled[start_idx:stop_idx]
-        node_feature_seq[window_idx] = build_window_node_features(ctrl_window)
+        edge_window = edge_signal_resampled[start_idx:stop_idx]
+        if resolved_node_feature_mode == "weakness_fusion":
+            node_feature_seq[window_idx] = build_window_weakness_fusion_features(
+                pd_indicator_window=pd_indicator_seq[start_idx:stop_idx],
+                id_effort_window=id_effort_indicator_seq[start_idx:stop_idx],
+                motion_score_nodes=motion_score_nodes,
+            )
+        else:
+            node_feature_seq[window_idx] = build_window_node_features(ctrl_window)
         raw_edge, active_edge, signed_edge = build_window_edge_weights(
-            ctrl_window,
+            edge_window,
             graph_template["edges"],
             edge_mode=edge_mode,
             edge_threshold=edge_threshold,
@@ -425,6 +590,13 @@ def build_trial_graph_sequence(
         "edge_mode": str(edge_mode),
         "edge_threshold": float(edge_threshold),
         "include_edge_sign": bool(include_edge_sign),
+        "node_feature_mode": str(resolved_node_feature_mode),
+        "feature_contract": (
+            "qpos drives replay; PD inverse gives ctrl indicators; inverse dynamics gives effort indicators; "
+            "GCN/node classification gives weakness indication."
+            if resolved_node_feature_mode == "weakness_fusion"
+            else "legacy ctrl_ref window features"
+        ),
         "cohort": str(cohort),
         "graph_source": str(graph_template.get("graph_source") or ""),
         "graph_warning": str(graph_template.get("graph_warning") or ""),
@@ -438,13 +610,15 @@ def build_trial_graph_sequence(
         "window_progress_end": window_progress_end,
         "qpos_resampled": qpos_resampled,
         "ctrl_resampled": ctrl_resampled,
+        "pd_ctrl_indicator_resampled": pd_indicator_seq,
+        "id_effort_indicator_resampled": id_effort_indicator_seq,
         "node_feature_seq": node_feature_seq,
         "edge_weight_raw_seq": edge_weight_raw_seq,
         "edge_active_seq": edge_active_seq,
         "edge_weight_seq": edge_weight_seq,
         "edge_index": edge_index,
-        "node_feature_names": list(NODE_FEATURE_NAMES),
-        "node_names": list(graph_template["node_names"]),
+        "node_feature_names": list(node_feature_names),
+        "node_names": node_names,
         "edges": list(graph_template["edges"]),
     }
 
@@ -470,6 +644,8 @@ def save_trial_graph_sequence(output_dir: Path, trial_sequence: dict[str, Any]) 
         window_progress_end=np.asarray(trial_sequence["window_progress_end"], dtype=np.float32),
         qpos_resampled=np.asarray(trial_sequence["qpos_resampled"], dtype=np.float32),
         ctrl_resampled=np.asarray(trial_sequence["ctrl_resampled"], dtype=np.float32),
+        pd_ctrl_indicator_resampled=np.asarray(trial_sequence.get("pd_ctrl_indicator_resampled", []), dtype=np.float32),
+        id_effort_indicator_resampled=np.asarray(trial_sequence.get("id_effort_indicator_resampled", []), dtype=np.float32),
         node_feature_seq=np.asarray(trial_sequence["node_feature_seq"], dtype=np.float32),
         edge_weight_raw_seq=np.asarray(trial_sequence["edge_weight_raw_seq"], dtype=np.float32),
         edge_active_seq=np.asarray(trial_sequence["edge_active_seq"], dtype=np.int8),
@@ -509,6 +685,8 @@ def load_trial_graph_sequence(path: Path) -> dict[str, Any]:
         "window_progress_end": np.asarray(bundle["window_progress_end"], dtype=np.float32) if "window_progress_end" in bundle.files else np.asarray(bundle["window_progress"], dtype=np.float32),
         "qpos_resampled": np.asarray(bundle["qpos_resampled"], dtype=np.float32),
         "ctrl_resampled": np.asarray(bundle["ctrl_resampled"], dtype=np.float32),
+        "pd_ctrl_indicator_resampled": np.asarray(bundle["pd_ctrl_indicator_resampled"], dtype=np.float32) if "pd_ctrl_indicator_resampled" in bundle.files else np.zeros((0, 0), dtype=np.float32),
+        "id_effort_indicator_resampled": np.asarray(bundle["id_effort_indicator_resampled"], dtype=np.float32) if "id_effort_indicator_resampled" in bundle.files else np.zeros((0, 0), dtype=np.float32),
         "node_feature_seq": np.asarray(bundle["node_feature_seq"], dtype=np.float32),
         "edge_weight_raw_seq": np.asarray(bundle["edge_weight_raw_seq"], dtype=np.float32),
         "edge_active_seq": np.asarray(bundle["edge_active_seq"], dtype=np.int8),
@@ -536,6 +714,7 @@ def build_dataset_manifest(records: list[dict[str, Any]]) -> pd.DataFrame:
                 "num_steps": int(item["metadata"]["num_steps"]),
                 "num_windows": int(item["metadata"]["num_windows"]),
                 "edge_mode": str(item["metadata"]["edge_mode"]),
+                "node_feature_mode": str(item["metadata"].get("node_feature_mode", "legacy_ctrl")),
                 "progress_mode": str(item["metadata"]["progress_mode"]),
                 "npz_path": str(item["npz_path"]),
                 "json_path": str(item["json_path"]),
@@ -779,6 +958,8 @@ def load_reference_sequence(reference_dir: Path) -> dict[str, Any]:
     bundle = np.load(npz_path)
     edges: list[dict[str, Any]] = []
     edges_csv = Path(str(summary.get("reference_sequence_edges_csv") or root / "reference_sequence_edges.csv"))
+    if not edges_csv.exists():
+        edges_csv = root / "reference_sequence_edges.csv"
     if edges_csv.exists():
         try:
             edge_df = pd.read_csv(edges_csv)

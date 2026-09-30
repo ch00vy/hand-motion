@@ -45,6 +45,7 @@ from scripts.build_teacher_inverse_dynamics import (  # noqa: E402
     maybe_build_static_prior,
     normalize_timestamps,
     save_trial_dataset,
+    set_initial_act_from_ctrl,
     solve_teacher_ctrl_frame,
     summarize_trial_quality,
 )
@@ -203,6 +204,20 @@ FINGER_QPOS_GROUPS = {
     "ring": (15, 17, 18),
     "pinky": (19, 21, 22),
 }
+FINGER_FLEXOR_ACTUATOR_NAMES = {
+    "thumb": ("FPL", "OP"),
+    "index": ("FDS2", "FDP2", "RI2", "LU_RB2", "UI_UB2"),
+    "middle": ("FDS3", "FDP3", "RI3", "LU_RB3", "UI_UB3"),
+    "ring": ("FDS4", "FDP4", "RI4", "LU_RB4", "UI_UB4"),
+    "pinky": ("FDS5", "FDP5", "RI5", "LU_RB5", "UI_UB5"),
+}
+FINGER_EXTENSOR_ACTUATOR_NAMES = {
+    "thumb": ("EPL", "EPB", "APL"),
+    "index": ("EDC2", "EIP"),
+    "middle": ("EDC3",),
+    "ring": ("EDC4",),
+    "pinky": ("EDC5", "EDM"),
+}
 
 
 def build_qpos_feedback_weights(
@@ -279,6 +294,21 @@ def parse_feedback_alphas(raw: str) -> list[float]:
         if value > 0.0:
             values.append(float(value))
     return values or [1.0]
+
+
+def parse_positive_int_list(raw: str) -> list[int]:
+    values: list[int] = []
+    for item in str(raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            value = int(item)
+        except ValueError:
+            continue
+        if value > 0:
+            values.append(value)
+    return values
 
 
 def compute_qpos_mismatch_feedback_tau(
@@ -463,6 +493,7 @@ def rollout_control_sequence(
     ctrl_seq: np.ndarray,
     dt_seq: np.ndarray,
     max_substeps: int,
+    initial_act_mode: str = "zero",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Roll the model forward for a short horizon and return the full state path."""
 
@@ -474,6 +505,9 @@ def rollout_control_sequence(
     dt_seq = np.asarray(dt_seq, dtype=float)
     qacc0 = np.zeros(int(m_raw.nv), dtype=float)
     set_full_state(m_raw, d_roll, qpos0, qvel0, qacc0, ctrl=ctrl_seq[0] if ctrl_seq.shape[0] else None, zero_act=True)
+    if str(initial_act_mode or "zero").strip().lower() in {"ctrl0", "first_ctrl"}:
+        set_initial_act_from_ctrl(m_raw, d_roll, ctrl_seq[0] if ctrl_seq.shape[0] else None)
+        mujoco.mj_forward(m_raw, d_roll)
     substeps = build_substeps_from_dt(dt_seq, float(m_raw.opt.timestep), max_substeps)
     qpos_roll = [np.asarray(d_roll.qpos, dtype=float).copy()]
     qvel_roll = [np.asarray(d_roll.qvel, dtype=float).copy()]
@@ -568,6 +602,52 @@ def compute_rollout_objective(
     }
 
 
+def compute_single_step_rollout_mismatch_tau(
+    *,
+    qpos_target: np.ndarray,
+    qvel_target: np.ndarray,
+    qpos_forward_next: np.ndarray,
+    qvel_forward_next: np.ndarray,
+    nv: int,
+    kp: float,
+    kv: float,
+    max_tau: float,
+    finger_flexion_weight: float,
+    distal_flexion_weight: float,
+) -> np.ndarray:
+    """Convert one-step forward mismatch into a local generalized torque assist.
+
+    The framewise inverse-dynamics solve can match tau locally yet still miss
+    the target posture after activation dynamics and forward integration. This
+    helper injects the *observed* one-step qpos/qvel replay error back into the
+    local solve so short-horizon optimization can try a control candidate that
+    explicitly reduces qpos_forward -> qpos_target mismatch.
+    """
+
+    out = np.zeros(max(0, int(nv)), dtype=float)
+    if int(nv) <= 0 or (float(kp) == 0.0 and float(kv) == 0.0):
+        return out
+    q_target = np.asarray(qpos_target, dtype=float).reshape(-1)
+    q_next = np.asarray(qpos_forward_next, dtype=float).reshape(-1)
+    v_target = np.asarray(qvel_target, dtype=float).reshape(-1)
+    v_next = np.asarray(qvel_forward_next, dtype=float).reshape(-1)
+    weights = build_qpos_feedback_weights(
+        int(nv),
+        finger_flexion_weight=float(finger_flexion_weight),
+        distal_flexion_weight=float(distal_flexion_weight),
+    )
+    qwidth = min(int(nv), len(q_target), len(q_next))
+    vwidth = min(int(nv), len(v_target), len(v_next))
+    if qwidth > 0:
+        out[:qwidth] += float(kp) * (q_target[:qwidth] - q_next[:qwidth])
+    if vwidth > 0:
+        out[:vwidth] += float(kv) * (v_target[:vwidth] - v_next[:vwidth])
+    out *= weights
+    if float(max_tau) > 0.0:
+        out = np.clip(out, -float(max_tau), float(max_tau))
+    return np.where(np.isfinite(out), out, 0.0)
+
+
 def apply_activation_preemphasis(
     ctrl_seq: np.ndarray,
     *,
@@ -592,6 +672,202 @@ def apply_activation_preemphasis(
         out[idx] = ctrl[idx] + (float(rise_gain) * np.maximum(delta, 0.0))
         prev = ctrl[idx]
     return np.clip(np.where(np.isfinite(out), out, 0.0), float(ctrl_lb), float(ctrl_ub))
+
+
+def apply_ctrl_timing_preemphasis(
+    ctrl_seq: np.ndarray,
+    *,
+    lead_frames: int,
+    blend_alpha: float,
+    preemphasis_gain: float,
+    ctrl_lb: float,
+    ctrl_ub: float,
+) -> np.ndarray:
+    """Advance upcoming controls and optionally boost rising edges.
+
+    This compensates the open-loop delay introduced by muscle activation
+    dynamics. The caller must validate and accept/reject the candidate.
+    """
+
+    ctrl = np.asarray(ctrl_seq, dtype=float)
+    if ctrl.ndim != 2 or ctrl.shape[0] == 0:
+        return np.clip(ctrl, float(ctrl_lb), float(ctrl_ub))
+    lead = max(0, int(lead_frames))
+    alpha = float(np.clip(float(blend_alpha), 0.0, 1.0))
+    if lead > 0 and alpha > 0.0:
+        future = np.vstack([ctrl[min(i + lead, ctrl.shape[0] - 1)] for i in range(ctrl.shape[0])])
+        out = (1.0 - alpha) * ctrl + alpha * future
+    else:
+        out = ctrl.copy()
+    if float(preemphasis_gain) > 0.0:
+        out = apply_activation_preemphasis(
+            out,
+            rise_gain=float(preemphasis_gain),
+            ctrl_lb=float(ctrl_lb),
+            ctrl_ub=float(ctrl_ub),
+        )
+    return np.clip(np.where(np.isfinite(out), out, 0.0), float(ctrl_lb), float(ctrl_ub))
+
+
+def _actuator_name_index(actuator_names: list[str]) -> dict[str, int]:
+    return {str(name).strip().upper(): int(idx) for idx, name in enumerate(list(actuator_names or [])) if str(name).strip()}
+
+
+def apply_replay_error_ctrl_boost(
+    ctrl_seq: np.ndarray,
+    *,
+    qpos_target: np.ndarray,
+    forward_qpos_seq: np.ndarray,
+    actuator_names: list[str],
+    boost_gain: float,
+    extensor_relief_gain: float,
+    ctrl_lb: float,
+    ctrl_ub: float,
+) -> np.ndarray:
+    """Nudge muscle controls from observed qpos replay error.
+
+    This is intentionally post-hoc and conservative. It does not assume the
+    framewise torque fit is wrong; it only tries a candidate sequence when the
+    actual forward replay is under-flexing a finger. The caller validates the
+    full sequence and keeps this candidate only if qpos mismatch improves.
+    """
+
+    ctrl = np.asarray(ctrl_seq, dtype=float)
+    target = np.asarray(qpos_target, dtype=float)
+    forward = np.asarray(forward_qpos_seq, dtype=float)
+    if ctrl.ndim != 2 or target.ndim != 2 or forward.ndim != 2 or ctrl.shape[0] == 0:
+        return np.clip(ctrl, float(ctrl_lb), float(ctrl_ub))
+    if float(boost_gain) <= 0.0:
+        return np.clip(ctrl, float(ctrl_lb), float(ctrl_ub))
+
+    name_to_idx = _actuator_name_index(actuator_names)
+    out = ctrl.copy()
+    n = min(ctrl.shape[0], max(0, target.shape[0] - 1), max(0, forward.shape[0] - 1))
+    if n <= 0:
+        return np.clip(out, float(ctrl_lb), float(ctrl_ub))
+
+    for frame_idx in range(n):
+        target_idx = frame_idx + 1
+        for finger, qpos_indices in FINGER_QPOS_GROUPS.items():
+            valid = [idx for idx in qpos_indices if idx < target.shape[1] and idx < forward.shape[1]]
+            if not valid:
+                continue
+            # Positive flexion error means recorded qpos is more closed than
+            # the control-driven replay; increase corresponding flexors.
+            flexion_error = float(np.mean(target[target_idx, valid] - forward[target_idx, valid]))
+            if not np.isfinite(flexion_error) or flexion_error <= 0.0:
+                continue
+            boost = float(boost_gain) * flexion_error
+            for name in FINGER_FLEXOR_ACTUATOR_NAMES.get(finger, ()):
+                idx = name_to_idx.get(str(name).upper())
+                if idx is not None and idx < out.shape[1]:
+                    out[frame_idx, idx] += boost
+            relief = max(0.0, float(extensor_relief_gain)) * boost
+            if relief > 0.0:
+                for name in FINGER_EXTENSOR_ACTUATOR_NAMES.get(finger, ()):
+                    idx = name_to_idx.get(str(name).upper())
+                    if idx is not None and idx < out.shape[1]:
+                        out[frame_idx, idx] -= relief
+    return np.clip(np.where(np.isfinite(out), out, 0.0), float(ctrl_lb), float(ctrl_ub))
+
+
+def build_state_feedback_refined_ctrl_sequence(
+    *,
+    model: Any,
+    data: Any,
+    trial: dict[str, Any],
+    actuator_names: list[str],
+    qpos_target: np.ndarray,
+    qvel_traj: np.ndarray,
+    dt: np.ndarray,
+    tau_seq: np.ndarray,
+    base_ctrl_seq: np.ndarray,
+    static_prior_seq: np.ndarray | None,
+    feedback_gain: float,
+    args: argparse.Namespace,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Re-solve controls along the actually simulated state path."""
+
+    from scripts.build_teacher_inverse_dynamics import set_full_state  # noqa: E402
+
+    m_raw, _ = _get_raw_model_data(model, data)
+    d_roll = mujoco.MjData(m_raw)
+    base_ctrl = np.asarray(base_ctrl_seq, dtype=float)
+    n = int(min(qpos_target.shape[0], base_ctrl.shape[0]))
+    if n <= 0:
+        return base_ctrl.copy(), []
+    out = base_ctrl.copy()
+    infos: list[dict[str, Any]] = []
+    qvel0 = qvel_traj[0] if qvel_traj.shape[0] else np.zeros(int(m_raw.nv), dtype=float)
+    set_full_state(m_raw, d_roll, qpos_target[0], qvel0, np.zeros(int(m_raw.nv), dtype=float), ctrl=base_ctrl[0], zero_act=True)
+    if str(getattr(args, "validation_initial_act_mode", "zero")).strip().lower() in {"ctrl0", "first_ctrl"}:
+        set_initial_act_from_ctrl(m_raw, d_roll, base_ctrl[0])
+        mujoco.mj_forward(m_raw, d_roll)
+
+    substeps = build_substeps_from_dt(dt, float(m_raw.opt.timestep), int(args.max_substeps_per_frame))
+    prev_ctrl = None
+    warm_teacher_mode = "dynamic_with_static_prior" if float(args.static_prior_weight) > 0.0 else "dynamic_only"
+    kp = float(getattr(args, "state_feedback_kp", 0.0)) * float(feedback_gain)
+    kv = float(getattr(args, "state_feedback_kv", 0.0)) * float(feedback_gain)
+    tau_clip = float(getattr(args, "state_feedback_tau_clip", 0.0))
+
+    for idx in range(max(0, n - 1)):
+        q_current = np.asarray(d_roll.qpos, dtype=float).copy()
+        v_current = np.asarray(d_roll.qvel, dtype=float).copy()
+        q_next = qpos_target[min(idx + 1, qpos_target.shape[0] - 1)]
+        v_next = qvel_traj[min(idx + 1, qvel_traj.shape[0] - 1)] if qvel_traj.shape[0] else np.zeros(int(m_raw.nv), dtype=float)
+        feedback_tau = compute_single_step_rollout_mismatch_tau(
+            qpos_target=q_next,
+            qvel_target=v_next,
+            qpos_forward_next=q_current,
+            qvel_forward_next=v_current,
+            nv=int(m_raw.nv),
+            kp=kp,
+            kv=kv,
+            max_tau=tau_clip,
+            finger_flexion_weight=float(getattr(args, "finger_flexion_feedback_weight", 1.0)),
+            distal_flexion_weight=float(getattr(args, "distal_flexion_feedback_weight", 1.0)),
+        )
+        tau_target = np.asarray(tau_seq[idx], dtype=float).reshape(-1) + feedback_tau
+        tau_target = clip_signal(tau_target, float(args.tau_clip))
+        static_prior = static_prior_seq[idx] if static_prior_seq is not None and idx < static_prior_seq.shape[0] else None
+        try:
+            ctrl, info = solve_teacher_ctrl_frame(
+                m_raw,
+                data,
+                tau_target,
+                q_current,
+                v_current,
+                prev_ctrl=prev_ctrl,
+                static_prior_ctrl=static_prior,
+                ctrl_lb=float(args.ctrl_lb),
+                ctrl_ub=float(args.ctrl_ub),
+                qp_reg=float(args.qp_reg),
+                prev_ctrl_weight=float(args.prev_ctrl_weight),
+                static_prior_weight=float(args.static_prior_weight),
+                prior_value=float(args.prior_value),
+                teacher_mode=warm_teacher_mode,
+                exercise_name=str(trial.get("exercise_name", "")),
+                actuator_names=actuator_names,
+            )
+        except Exception:
+            ctrl = base_ctrl[idx]
+            info = {"solver_mode": "state_feedback_refine:fallback_base"}
+        info["solver_mode"] = "state_feedback_refine"
+        info["state_feedback_gain"] = float(feedback_gain)
+        info["state_feedback_tau_norm"] = float(np.linalg.norm(feedback_tau))
+        out[idx] = np.asarray(ctrl, dtype=float).reshape(-1)
+        prev_ctrl = out[idx].copy()
+        d_roll.ctrl[:] = 0.0
+        d_roll.ctrl[: min(int(m_raw.nu), out.shape[1])] = out[idx, : min(int(m_raw.nu), out.shape[1])]
+        for _ in range(int(substeps[min(idx + 1, len(substeps) - 1)])):
+            mujoco.mj_step(m_raw, d_roll)
+        infos.append(info)
+
+    if n >= 1:
+        out[n - 1] = out[n - 2] if n >= 2 else base_ctrl[n - 1]
+        infos.append({"solver_mode": "state_feedback_refine:tail", "state_feedback_gain": float(feedback_gain), "state_feedback_tau_norm": 0.0})
+    return np.clip(np.where(np.isfinite(out), out, 0.0), float(args.ctrl_lb), float(args.ctrl_ub)), infos
 
 
 def optimize_short_horizon_controls(
@@ -627,6 +903,7 @@ def optimize_short_horizon_controls(
         ctrl_seq=seq,
         dt_seq=dt_seq,
         max_substeps=int(args.max_substeps_per_frame),
+        initial_act_mode=str(getattr(args, "rollout_initial_act_mode", "zero")),
     )
     current_obj, current_terms = compute_rollout_objective(
         qpos_roll=qpos_roll,
@@ -648,71 +925,90 @@ def optimize_short_horizon_controls(
     accepted_updates = 0
     blend_alphas = [0.35, 0.65, 1.0]
     teacher_mode_warm = "dynamic_with_static_prior" if float(args.static_prior_weight) > 0.0 else "dynamic_only"
+    rollout_feedback_gain = max(0.0, float(getattr(args, "rollout_mismatch_feedback_gain", 1.0)))
     for _ in range(max(1, int(args.horizon_iters))):
         improved = False
         for j in range(seq.shape[0]):
             prev_for_step = prev_ctrl_anchor if j == 0 else seq[j - 1]
             static_prior = prior_seq[j] if prior_seq.size else None
-            try:
-                candidate_ctrl, _ = solve_teacher_ctrl_frame(
-                    model,
-                    data,
-                    tau_target_seq[j],
-                    qpos_roll[j],
-                    qvel_roll[j],
-                    prev_ctrl=prev_for_step,
-                    static_prior_ctrl=static_prior,
-                    ctrl_lb=float(args.ctrl_lb),
-                    ctrl_ub=float(args.ctrl_ub),
-                    qp_reg=float(args.qp_reg),
-                    prev_ctrl_weight=float(args.prev_ctrl_weight),
-                    static_prior_weight=float(args.static_prior_weight),
-                    prior_value=float(args.prior_value),
-                    teacher_mode=teacher_mode_warm,
-                    exercise_name=None,
-                    actuator_names=actuator_names,
+            candidate_tau_targets = [np.asarray(tau_target_seq[j], dtype=float).reshape(-1)]
+            if rollout_feedback_gain > 0.0 and j + 1 < qpos_roll.shape[0]:
+                feedback_tau = compute_single_step_rollout_mismatch_tau(
+                    qpos_target=qpos_target_seq[j],
+                    qvel_target=qvel_target_seq[j] if j < qvel_target_seq.shape[0] else np.zeros(int(model.nv), dtype=float),
+                    qpos_forward_next=qpos_roll[j + 1],
+                    qvel_forward_next=qvel_roll[j + 1] if j + 1 < qvel_roll.shape[0] else np.zeros(int(model.nv), dtype=float),
+                    nv=int(model.nv),
+                    kp=float(getattr(args, "mismatch_feedback_kp", 0.0)) * rollout_feedback_gain,
+                    kv=float(getattr(args, "mismatch_feedback_kv", 0.0)) * rollout_feedback_gain,
+                    max_tau=float(getattr(args, "mismatch_feedback_tau_clip", 0.0)),
+                    finger_flexion_weight=float(getattr(args, "finger_flexion_feedback_weight", 1.0)),
+                    distal_flexion_weight=float(getattr(args, "distal_flexion_feedback_weight", 1.0)),
                 )
-            except Exception:
-                continue
+                if np.linalg.norm(feedback_tau) > 1e-12:
+                    candidate_tau_targets.append(clip_signal(candidate_tau_targets[0] + feedback_tau, float(args.tau_clip)))
             base_seq = seq.copy()
             best_local_obj = current_obj
             best_local_seq = seq
             best_local_roll = (qpos_roll, qvel_roll)
             best_local_terms = current_terms
-            for alpha in blend_alphas:
-                proposal = np.clip((1.0 - float(alpha)) * seq[j] + float(alpha) * candidate_ctrl, float(args.ctrl_lb), float(args.ctrl_ub))
-                trial_seq = base_seq.copy()
-                trial_seq[j] = proposal
-                trial_qpos_roll, trial_qvel_roll = rollout_control_sequence(
-                    model,
-                    qpos0=qpos0,
-                    qvel0=qvel0,
-                    ctrl_seq=trial_seq,
-                    dt_seq=dt_seq,
-                    max_substeps=int(args.max_substeps_per_frame),
-                )
-                trial_obj, trial_terms = compute_rollout_objective(
-                    qpos_roll=trial_qpos_roll,
-                    qvel_roll=trial_qvel_roll,
-                    qpos_target_seq=qpos_target_seq,
-                    qvel_target_seq=qvel_target_seq,
-                    ctrl_seq=trial_seq,
-                    prior_seq=prior_seq,
-                    prev_ctrl_anchor=prev_ctrl_anchor,
-                    qpos_weight=float(args.rollout_qpos_weight),
-                    qvel_weight=float(args.rollout_qvel_weight),
-                    final_qpos_weight=float(getattr(args, "rollout_final_qpos_weight", 0.0)),
-                    finger_flexion_weight=float(getattr(args, "finger_flexion_feedback_weight", 1.0)),
-                    distal_flexion_weight=float(getattr(args, "distal_flexion_feedback_weight", 1.0)),
-                    u_weight=float(args.rollout_u_weight),
-                    delta_u_weight=float(args.rollout_delta_u_weight),
-                    prior_weight=float(args.rollout_prior_weight),
-                )
-                if trial_obj + 1e-9 < best_local_obj:
-                    best_local_obj = trial_obj
-                    best_local_seq = trial_seq
-                    best_local_roll = (trial_qpos_roll, trial_qvel_roll)
-                    best_local_terms = trial_terms
+            for tau_candidate in candidate_tau_targets:
+                try:
+                    candidate_ctrl, _ = solve_teacher_ctrl_frame(
+                        model,
+                        data,
+                        tau_candidate,
+                        qpos_roll[j],
+                        qvel_roll[j],
+                        prev_ctrl=prev_for_step,
+                        static_prior_ctrl=static_prior,
+                        ctrl_lb=float(args.ctrl_lb),
+                        ctrl_ub=float(args.ctrl_ub),
+                        qp_reg=float(args.qp_reg),
+                        prev_ctrl_weight=float(args.prev_ctrl_weight),
+                        static_prior_weight=float(args.static_prior_weight),
+                        prior_value=float(args.prior_value),
+                        teacher_mode=teacher_mode_warm,
+                        exercise_name=None,
+                        actuator_names=actuator_names,
+                    )
+                except Exception:
+                    continue
+                for alpha in blend_alphas:
+                    proposal = np.clip((1.0 - float(alpha)) * seq[j] + float(alpha) * candidate_ctrl, float(args.ctrl_lb), float(args.ctrl_ub))
+                    trial_seq = base_seq.copy()
+                    trial_seq[j] = proposal
+                    trial_qpos_roll, trial_qvel_roll = rollout_control_sequence(
+                        model,
+                        qpos0=qpos0,
+                        qvel0=qvel0,
+                        ctrl_seq=trial_seq,
+                        dt_seq=dt_seq,
+                        max_substeps=int(args.max_substeps_per_frame),
+                        initial_act_mode=str(getattr(args, "rollout_initial_act_mode", "zero")),
+                    )
+                    trial_obj, trial_terms = compute_rollout_objective(
+                        qpos_roll=trial_qpos_roll,
+                        qvel_roll=trial_qvel_roll,
+                        qpos_target_seq=qpos_target_seq,
+                        qvel_target_seq=qvel_target_seq,
+                        ctrl_seq=trial_seq,
+                        prior_seq=prior_seq,
+                        prev_ctrl_anchor=prev_ctrl_anchor,
+                        qpos_weight=float(args.rollout_qpos_weight),
+                        qvel_weight=float(args.rollout_qvel_weight),
+                        final_qpos_weight=float(getattr(args, "rollout_final_qpos_weight", 0.0)),
+                        finger_flexion_weight=float(getattr(args, "finger_flexion_feedback_weight", 1.0)),
+                        distal_flexion_weight=float(getattr(args, "distal_flexion_feedback_weight", 1.0)),
+                        u_weight=float(args.rollout_u_weight),
+                        delta_u_weight=float(args.rollout_delta_u_weight),
+                        prior_weight=float(args.rollout_prior_weight),
+                    )
+                    if trial_obj + 1e-9 < best_local_obj:
+                        best_local_obj = trial_obj
+                        best_local_seq = trial_seq
+                        best_local_roll = (trial_qpos_roll, trial_qvel_roll)
+                        best_local_terms = trial_terms
             if best_local_obj + 1e-9 < current_obj:
                 seq = best_local_seq
                 qpos_roll, qvel_roll = best_local_roll
@@ -769,6 +1065,9 @@ def solve_teacher_short_horizon(
     from scripts.build_teacher_inverse_dynamics import set_full_state  # noqa: E402
 
     set_full_state(m_raw, d_state, qpos_target[0], qvel_traj[0], np.zeros(int(m_raw.nv), dtype=float), zero_act=True)
+    if str(getattr(args, "rollout_initial_act_mode", "zero")).strip().lower() in {"ctrl0", "first_ctrl"}:
+        set_initial_act_from_ctrl(m_raw, d_state, warm_ctrl_seq[0] if warm_ctrl_seq.shape[0] else None)
+        mujoco.mj_forward(m_raw, d_state)
     ctrl_final = warm_ctrl_seq.copy()
     solver_infos: list[dict[str, Any]] = [dict() for _ in range(n)]
     prev_committed_ctrl = None
@@ -811,6 +1110,7 @@ def solve_teacher_short_horizon(
             ctrl_seq=opt_seq,
             dt_seq=dt[t + 1 : t + 1 + horizon],
             max_substeps=int(args.max_substeps_per_frame),
+            initial_act_mode=str(getattr(args, "rollout_initial_act_mode", "zero")),
         )
         n_commit = min(commit_frames, horizon)
         for j in range(n_commit):
@@ -1004,9 +1304,13 @@ def run_trajectory_teacher_trial(
         dt,
         max_substeps=int(args.max_substeps_per_frame),
         validation_window_size=int(args.validation_window_size),
+        initial_act_mode=str(getattr(args, "validation_initial_act_mode", "zero")),
     )
     feedback_history: list[dict[str, Any]] = []
     activation_preemphasis_history: list[dict[str, Any]] = []
+    state_feedback_history: list[dict[str, Any]] = []
+    ctrl_timing_history: list[dict[str, Any]] = []
+    ctrl_replay_boost_history: list[dict[str, Any]] = []
     best_ctrl_seq = ctrl_seq
     best_solver_infos = solver_infos
     best_validation = validation
@@ -1079,6 +1383,7 @@ def run_trajectory_teacher_trial(
                 dt,
                 max_substeps=int(args.max_substeps_per_frame),
                 validation_window_size=int(args.validation_window_size),
+                initial_act_mode=str(getattr(args, "validation_initial_act_mode", "zero")),
             )
             candidate_objective = compute_weighted_qpos_mismatch_objective(
                 qpos_target=qpos_target,
@@ -1148,6 +1453,7 @@ def run_trajectory_teacher_trial(
                 dt,
                 max_substeps=int(args.max_substeps_per_frame),
                 validation_window_size=int(args.validation_window_size),
+                initial_act_mode=str(getattr(args, "validation_initial_act_mode", "zero")),
             )
             candidate_objective = compute_weighted_qpos_mismatch_objective(
                 qpos_target=qpos_target,
@@ -1210,6 +1516,295 @@ def run_trajectory_teacher_trial(
                 best_solver_infos = recomputed_infos
                 best_mismatch_objective = new_mismatch_objective
 
+    state_feedback_iters = max(0, int(getattr(args, "state_feedback_refine_iters", 0)))
+    state_feedback_gains = parse_feedback_alphas(str(getattr(args, "state_feedback_gains", "1.0")))
+    if state_feedback_iters > 0 and state_feedback_gains and float(getattr(args, "state_feedback_kp", 0.0)) > 0.0:
+        for feedback_iter in range(state_feedback_iters):
+            old_rmse = float(best_validation.get("rmse_forward_error", 0.0))
+            best_candidate = None
+            for gain in state_feedback_gains:
+                candidate_ctrl_seq, candidate_solver_infos = build_state_feedback_refined_ctrl_sequence(
+                    model=m_raw,
+                    data=d_raw,
+                    trial=trial,
+                    actuator_names=actuator_names,
+                    qpos_target=qpos_target,
+                    qvel_traj=qvel_traj,
+                    dt=dt,
+                    tau_seq=best_tau_seq,
+                    base_ctrl_seq=best_ctrl_seq,
+                    static_prior_seq=static_prior_seq,
+                    feedback_gain=float(gain),
+                    args=args,
+                )
+                candidate_validation = forward_validate_sequence(
+                    m_raw,
+                    qpos_target,
+                    qvel_traj,
+                    candidate_ctrl_seq,
+                    dt,
+                    max_substeps=int(args.max_substeps_per_frame),
+                    validation_window_size=int(args.validation_window_size),
+                    initial_act_mode=str(getattr(args, "validation_initial_act_mode", "zero")),
+                )
+                candidate_objective = compute_weighted_qpos_mismatch_objective(
+                    qpos_target=qpos_target,
+                    qvel_target=qvel_traj,
+                    validation=candidate_validation,
+                    ctrl_seq=candidate_ctrl_seq,
+                    nv=int(m_raw.nv),
+                    qpos_weight=float(getattr(args, "mismatch_feedback_qpos_weight", 1.0)),
+                    qvel_weight=float(getattr(args, "mismatch_feedback_qvel_weight", 0.0)),
+                    finger_flexion_weight=float(getattr(args, "finger_flexion_feedback_weight", 1.0)),
+                    distal_flexion_weight=float(getattr(args, "distal_flexion_feedback_weight", 1.0)),
+                    final_weight=float(getattr(args, "mismatch_feedback_final_weight", 0.5)),
+                    control_weight=float(getattr(args, "mismatch_feedback_control_weight", 0.0)),
+                    smoothness_weight=float(getattr(args, "mismatch_feedback_smoothness_weight", 0.0)),
+                )
+                if best_candidate is None or float(candidate_objective) < float(best_candidate["objective"]):
+                    best_candidate = {
+                        "gain": float(gain),
+                        "ctrl_seq": candidate_ctrl_seq,
+                        "solver_infos": candidate_solver_infos,
+                        "validation": candidate_validation,
+                        "objective": float(candidate_objective),
+                    }
+            if best_candidate is None:
+                break
+            new_mismatch_objective = float(best_candidate["objective"])
+            new_rmse = float(best_candidate["validation"].get("rmse_forward_error", 0.0))
+            accepted = bool(new_mismatch_objective <= best_mismatch_objective + 1e-12)
+            state_feedback_history.append(
+                {
+                    "iter": int(feedback_iter + 1),
+                    "gain": float(best_candidate["gain"]),
+                    "old_rmse_forward_error": old_rmse,
+                    "new_rmse_forward_error": new_rmse,
+                    "old_qpos_mismatch_objective": float(best_mismatch_objective),
+                    "new_qpos_mismatch_objective": float(new_mismatch_objective),
+                    "accepted": accepted,
+                }
+            )
+            if not accepted:
+                break
+            best_ctrl_seq = best_candidate["ctrl_seq"]
+            best_solver_infos = best_candidate["solver_infos"]
+            best_validation = best_candidate["validation"]
+            best_mismatch_objective = new_mismatch_objective
+
+    timing_iters = max(0, int(getattr(args, "ctrl_timing_refine_iters", 0)))
+    timing_leads = parse_positive_int_list(str(getattr(args, "ctrl_timing_lead_frames", "1,2")))
+    timing_alphas = parse_feedback_alphas(str(getattr(args, "ctrl_timing_blend_alphas", "0.25,0.5")))
+    timing_pre_gains = [0.0, *parse_feedback_alphas(str(getattr(args, "ctrl_timing_preemphasis_gains", "0.2,0.3")))]
+    timing_obj_tol = max(0.0, float(getattr(args, "ctrl_timing_objective_tolerance", 0.0)))
+    if timing_iters > 0 and timing_leads:
+        for timing_iter in range(timing_iters):
+            old_rmse = float(best_validation.get("rmse_forward_error", 0.0))
+            old_mean_joint = float(best_validation.get("mean_joint_error", 0.0))
+            best_candidate = None
+            max_allowed_objective = float(best_mismatch_objective) * (1.0 + timing_obj_tol)
+            for lead in timing_leads:
+                for alpha in timing_alphas:
+                    for pre_gain in timing_pre_gains:
+                        candidate_ctrl_seq = apply_ctrl_timing_preemphasis(
+                            best_ctrl_seq,
+                            lead_frames=int(lead),
+                            blend_alpha=float(alpha),
+                            preemphasis_gain=float(pre_gain),
+                            ctrl_lb=float(args.ctrl_lb),
+                            ctrl_ub=float(args.ctrl_ub),
+                        )
+                        candidate_validation = forward_validate_sequence(
+                            m_raw,
+                            qpos_target,
+                            qvel_traj,
+                            candidate_ctrl_seq,
+                            dt,
+                            max_substeps=int(args.max_substeps_per_frame),
+                            validation_window_size=int(args.validation_window_size),
+                            initial_act_mode=str(getattr(args, "validation_initial_act_mode", "zero")),
+                        )
+                        candidate_objective = compute_weighted_qpos_mismatch_objective(
+                            qpos_target=qpos_target,
+                            qvel_target=qvel_traj,
+                            validation=candidate_validation,
+                            ctrl_seq=candidate_ctrl_seq,
+                            nv=int(m_raw.nv),
+                            qpos_weight=float(getattr(args, "mismatch_feedback_qpos_weight", 1.0)),
+                            qvel_weight=float(getattr(args, "mismatch_feedback_qvel_weight", 0.0)),
+                            finger_flexion_weight=float(getattr(args, "finger_flexion_feedback_weight", 1.0)),
+                            distal_flexion_weight=float(getattr(args, "distal_flexion_feedback_weight", 1.0)),
+                            final_weight=float(getattr(args, "mismatch_feedback_final_weight", 0.5)),
+                            control_weight=float(getattr(args, "mismatch_feedback_control_weight", 0.0)),
+                            smoothness_weight=float(getattr(args, "mismatch_feedback_smoothness_weight", 0.0)),
+                        )
+                        candidate_rmse = float(candidate_validation.get("rmse_forward_error", 0.0))
+                        if candidate_rmse >= old_rmse - 1e-12:
+                            continue
+                        if float(candidate_objective) > max_allowed_objective + 1e-12:
+                            continue
+                        if best_candidate is None or candidate_rmse < float(best_candidate["rmse"]):
+                            best_candidate = {
+                                "lead_frames": int(lead),
+                                "blend_alpha": float(alpha),
+                                "preemphasis_gain": float(pre_gain),
+                                "ctrl_seq": candidate_ctrl_seq,
+                                "validation": candidate_validation,
+                                "objective": float(candidate_objective),
+                                "rmse": candidate_rmse,
+                            }
+            if best_candidate is None:
+                ctrl_timing_history.append(
+                    {
+                        "iter": int(timing_iter + 1),
+                        "old_rmse_forward_error": old_rmse,
+                        "new_rmse_forward_error": old_rmse,
+                        "old_mean_joint_error": old_mean_joint,
+                        "new_mean_joint_error": old_mean_joint,
+                        "old_qpos_mismatch_objective": float(best_mismatch_objective),
+                        "new_qpos_mismatch_objective": float(best_mismatch_objective),
+                        "accepted": False,
+                        "reason": "no_candidate_within_objective_tolerance",
+                    }
+                )
+                break
+            new_mismatch_objective = float(best_candidate["objective"])
+            new_rmse = float(best_candidate["validation"].get("rmse_forward_error", 0.0))
+            new_mean_joint = float(best_candidate["validation"].get("mean_joint_error", 0.0))
+            accepted = bool(new_rmse < old_rmse - 1e-12)
+            ctrl_timing_history.append(
+                {
+                    "iter": int(timing_iter + 1),
+                    "lead_frames": int(best_candidate["lead_frames"]),
+                    "blend_alpha": float(best_candidate["blend_alpha"]),
+                    "preemphasis_gain": float(best_candidate["preemphasis_gain"]),
+                    "old_rmse_forward_error": old_rmse,
+                    "new_rmse_forward_error": new_rmse,
+                    "old_mean_joint_error": old_mean_joint,
+                    "new_mean_joint_error": new_mean_joint,
+                    "old_qpos_mismatch_objective": float(best_mismatch_objective),
+                    "new_qpos_mismatch_objective": new_mismatch_objective,
+                    "objective_tolerance": timing_obj_tol,
+                    "accepted": accepted,
+                }
+            )
+            if not accepted:
+                break
+            best_ctrl_seq = best_candidate["ctrl_seq"]
+            best_validation = best_candidate["validation"]
+            best_mismatch_objective = new_mismatch_objective
+            recomputed_infos = []
+            prev_ctrl_for_diag = None
+            for diag_idx in range(best_ctrl_seq.shape[0]):
+                static_prior = static_prior_seq[diag_idx] if static_prior_seq is not None and diag_idx < static_prior_seq.shape[0] else None
+                info = evaluate_ctrl_diagnostic(
+                    m_raw,
+                    data,
+                    best_tau_seq[diag_idx],
+                    qpos_target[diag_idx],
+                    qvel_traj[diag_idx],
+                    best_ctrl_seq[diag_idx],
+                    prev_ctrl=prev_ctrl_for_diag,
+                    static_prior_ctrl=static_prior,
+                    ctrl_lb=float(args.ctrl_lb),
+                    ctrl_ub=float(args.ctrl_ub),
+                    solver_mode="ctrl_timing_preemphasis",
+                )
+                recomputed_infos.append(info)
+                prev_ctrl_for_diag = best_ctrl_seq[diag_idx].copy()
+            best_solver_infos = recomputed_infos
+
+    boost_iters = max(0, int(getattr(args, "ctrl_replay_boost_iters", 0)))
+    boost_gains = parse_feedback_alphas(str(getattr(args, "ctrl_replay_boost_gains", "0.5,1.0")))
+    if boost_iters > 0 and boost_gains:
+        for boost_iter in range(boost_iters):
+            forward_qpos_seq = np.asarray(best_validation.get("forward_qpos_seq", []), dtype=float)
+            old_rmse = float(best_validation.get("rmse_forward_error", 0.0))
+            best_candidate = None
+            for gain in boost_gains:
+                candidate_ctrl_seq = apply_replay_error_ctrl_boost(
+                    best_ctrl_seq,
+                    qpos_target=qpos_target,
+                    forward_qpos_seq=forward_qpos_seq,
+                    actuator_names=actuator_names,
+                    boost_gain=float(gain),
+                    extensor_relief_gain=float(getattr(args, "ctrl_replay_extensor_relief_gain", 0.25)),
+                    ctrl_lb=float(args.ctrl_lb),
+                    ctrl_ub=float(args.ctrl_ub),
+                )
+                candidate_validation = forward_validate_sequence(
+                    m_raw,
+                    qpos_target,
+                    qvel_traj,
+                    candidate_ctrl_seq,
+                    dt,
+                    max_substeps=int(args.max_substeps_per_frame),
+                    validation_window_size=int(args.validation_window_size),
+                    initial_act_mode=str(getattr(args, "validation_initial_act_mode", "zero")),
+                )
+                candidate_objective = compute_weighted_qpos_mismatch_objective(
+                    qpos_target=qpos_target,
+                    qvel_target=qvel_traj,
+                    validation=candidate_validation,
+                    ctrl_seq=candidate_ctrl_seq,
+                    nv=int(m_raw.nv),
+                    qpos_weight=float(getattr(args, "mismatch_feedback_qpos_weight", 1.0)),
+                    qvel_weight=float(getattr(args, "mismatch_feedback_qvel_weight", 0.0)),
+                    finger_flexion_weight=float(getattr(args, "finger_flexion_feedback_weight", 1.0)),
+                    distal_flexion_weight=float(getattr(args, "distal_flexion_feedback_weight", 1.0)),
+                    final_weight=float(getattr(args, "mismatch_feedback_final_weight", 0.5)),
+                    control_weight=float(getattr(args, "mismatch_feedback_control_weight", 0.0)),
+                    smoothness_weight=float(getattr(args, "mismatch_feedback_smoothness_weight", 0.0)),
+                )
+                if best_candidate is None or float(candidate_objective) < float(best_candidate["objective"]):
+                    best_candidate = {
+                        "gain": float(gain),
+                        "ctrl_seq": candidate_ctrl_seq,
+                        "validation": candidate_validation,
+                        "objective": float(candidate_objective),
+                    }
+            if best_candidate is None:
+                break
+            new_mismatch_objective = float(best_candidate["objective"])
+            new_rmse = float(best_candidate["validation"].get("rmse_forward_error", 0.0))
+            accepted = bool(new_mismatch_objective <= best_mismatch_objective + 1e-12)
+            ctrl_replay_boost_history.append(
+                {
+                    "iter": int(boost_iter + 1),
+                    "gain": float(best_candidate["gain"]),
+                    "old_rmse_forward_error": old_rmse,
+                    "new_rmse_forward_error": new_rmse,
+                    "old_qpos_mismatch_objective": float(best_mismatch_objective),
+                    "new_qpos_mismatch_objective": float(new_mismatch_objective),
+                    "accepted": accepted,
+                }
+            )
+            if not accepted:
+                break
+            best_ctrl_seq = best_candidate["ctrl_seq"]
+            best_validation = best_candidate["validation"]
+            recomputed_infos = []
+            prev_ctrl_for_diag = None
+            for diag_idx in range(best_ctrl_seq.shape[0]):
+                static_prior = static_prior_seq[diag_idx] if static_prior_seq is not None and diag_idx < static_prior_seq.shape[0] else None
+                info = evaluate_ctrl_diagnostic(
+                    m_raw,
+                    data,
+                    best_tau_seq[diag_idx],
+                    qpos_target[diag_idx],
+                    qvel_traj[diag_idx],
+                    best_ctrl_seq[diag_idx],
+                    prev_ctrl=prev_ctrl_for_diag,
+                    static_prior_ctrl=static_prior,
+                    ctrl_lb=float(args.ctrl_lb),
+                    ctrl_ub=float(args.ctrl_ub),
+                    solver_mode="ctrl_replay_boost",
+                )
+                recomputed_infos.append(info)
+                prev_ctrl_for_diag = best_ctrl_seq[diag_idx].copy()
+            best_solver_infos = recomputed_infos
+            best_mismatch_objective = new_mismatch_objective
+
     ctrl_seq = best_ctrl_seq
     solver_infos = best_solver_infos
     validation = best_validation
@@ -1253,6 +1848,27 @@ def run_trajectory_teacher_trial(
             "activation_preemphasis_gain": float(getattr(args, "activation_preemphasis_gain", 0.0)),
             "activation_preemphasis_accepted": int(sum(1 for item in activation_preemphasis_history if bool(item.get("accepted", False)))),
             "activation_preemphasis_history": json.dumps(activation_preemphasis_history, ensure_ascii=False),
+            "state_feedback_refine_iters_requested": int(getattr(args, "state_feedback_refine_iters", 0)),
+            "state_feedback_refine_accepted": int(sum(1 for item in state_feedback_history if bool(item.get("accepted", False)))),
+            "state_feedback_kp": float(getattr(args, "state_feedback_kp", 0.0)),
+            "state_feedback_kv": float(getattr(args, "state_feedback_kv", 0.0)),
+            "state_feedback_gains": str(getattr(args, "state_feedback_gains", "")),
+            "state_feedback_history": json.dumps(state_feedback_history, ensure_ascii=False),
+            "ctrl_timing_refine_iters_requested": int(getattr(args, "ctrl_timing_refine_iters", 0)),
+            "ctrl_timing_refine_accepted": int(sum(1 for item in ctrl_timing_history if bool(item.get("accepted", False)))),
+            "ctrl_timing_lead_frames": str(getattr(args, "ctrl_timing_lead_frames", "")),
+            "ctrl_timing_blend_alphas": str(getattr(args, "ctrl_timing_blend_alphas", "")),
+            "ctrl_timing_preemphasis_gains": str(getattr(args, "ctrl_timing_preemphasis_gains", "")),
+            "ctrl_timing_objective_tolerance": float(getattr(args, "ctrl_timing_objective_tolerance", 0.0)),
+            "ctrl_timing_history": json.dumps(ctrl_timing_history, ensure_ascii=False),
+            "ctrl_replay_boost_iters_requested": int(getattr(args, "ctrl_replay_boost_iters", 0)),
+            "ctrl_replay_boost_accepted": int(sum(1 for item in ctrl_replay_boost_history if bool(item.get("accepted", False)))),
+            "ctrl_replay_boost_gains": str(getattr(args, "ctrl_replay_boost_gains", "")),
+            "ctrl_replay_extensor_relief_gain": float(getattr(args, "ctrl_replay_extensor_relief_gain", 0.0)),
+            "ctrl_replay_boost_history": json.dumps(ctrl_replay_boost_history, ensure_ascii=False),
+            "validation_initial_act_mode": str(getattr(args, "validation_initial_act_mode", "zero")),
+            "rollout_initial_act_mode": str(getattr(args, "rollout_initial_act_mode", "zero")),
+            "validation_reported_initial_act_mode": str(best_validation.get("initial_act_mode", "")),
         }
     )
     reject_reasons = quality.get("reject_reasons", [])
@@ -1318,12 +1934,16 @@ def write_trajectory_report(
         f"- Feedback objective weights: qpos=`{float(getattr(args, 'mismatch_feedback_qpos_weight', 1.0)):.4g}`, qvel=`{float(getattr(args, 'mismatch_feedback_qvel_weight', 0.0)):.4g}`, final=`{float(getattr(args, 'mismatch_feedback_final_weight', 0.5)):.4g}`, u=`{float(getattr(args, 'mismatch_feedback_control_weight', 0.0)):.4g}`, delta_u=`{float(getattr(args, 'mismatch_feedback_smoothness_weight', 0.0)):.4g}`.",
         f"- Finger feedback weights: flexion=`{float(getattr(args, 'finger_flexion_feedback_weight', 1.0)):.4g}`, distal=`{float(getattr(args, 'distal_flexion_feedback_weight', 1.0)):.4g}`, adaptive=`{bool(getattr(args, 'adaptive_finger_feedback', False))}`, alphas=`{str(getattr(args, 'mismatch_feedback_alphas', '1.0'))}`.",
         f"- Activation pre-emphasis: gain=`{float(getattr(args, 'activation_preemphasis_gain', 0.0)):.4g}`, alphas=`{str(getattr(args, 'activation_preemphasis_alphas', '1.0'))}`.",
+        f"- State-feedback refinement: iters=`{int(getattr(args, 'state_feedback_refine_iters', 0))}`, kp=`{float(getattr(args, 'state_feedback_kp', 0.0)):.4g}`, kv=`{float(getattr(args, 'state_feedback_kv', 0.0)):.4g}`, gains=`{str(getattr(args, 'state_feedback_gains', ''))}`.",
+        f"- Ctrl timing/pre-emphasis refinement: iters=`{int(getattr(args, 'ctrl_timing_refine_iters', 0))}`, lead=`{str(getattr(args, 'ctrl_timing_lead_frames', ''))}`, alpha=`{str(getattr(args, 'ctrl_timing_blend_alphas', ''))}`, pre=`{str(getattr(args, 'ctrl_timing_preemphasis_gains', ''))}`, objective_tol=`{float(getattr(args, 'ctrl_timing_objective_tolerance', 0.0)):.4g}`.",
+        f"- Ctrl replay boost: iters=`{int(getattr(args, 'ctrl_replay_boost_iters', 0))}`, gains=`{str(getattr(args, 'ctrl_replay_boost_gains', ''))}`, extensor_relief=`{float(getattr(args, 'ctrl_replay_extensor_relief_gain', 0.0)):.4g}`.",
+        f"- Initial activation modes: validation=`{str(getattr(args, 'validation_initial_act_mode', 'zero'))}`, rollout=`{str(getattr(args, 'rollout_initial_act_mode', 'zero'))}`.",
         "",
         "## Actuator-Space Solve",
         "",
         f"- Reference mode: `{args.teacher_mode}`",
         f"- Short-horizon rollout config: horizon=`{int(args.horizon_size)}`, iterations=`{int(args.horizon_iters)}`, commit=`{int(args.commit_frames)}`",
-        f"- Rollout objective weights: qpos=`{float(args.rollout_qpos_weight):.4g}`, qvel=`{float(args.rollout_qvel_weight):.4g}`, final=`{float(getattr(args, 'rollout_final_qpos_weight', 0.0)):.4g}`, u=`{float(args.rollout_u_weight):.4g}`, delta_u=`{float(args.rollout_delta_u_weight):.4g}`, prior=`{float(args.rollout_prior_weight):.4g}`",
+        f"- Rollout objective weights: qpos=`{float(args.rollout_qpos_weight):.4g}`, qvel=`{float(args.rollout_qvel_weight):.4g}`, final=`{float(getattr(args, 'rollout_final_qpos_weight', 0.0)):.4g}`, mismatch_gain=`{float(getattr(args, 'rollout_mismatch_feedback_gain', 1.0)):.4g}`, u=`{float(args.rollout_u_weight):.4g}`, delta_u=`{float(args.rollout_delta_u_weight):.4g}`, prior=`{float(args.rollout_prior_weight):.4g}`",
         f"- Prior mode: `{args.teacher_prior_mode}`",
         f"- Regularization: qp_reg=`{float(args.qp_reg):.4g}`, prev_ctrl_weight=`{float(args.prev_ctrl_weight):.4g}`, static_prior_weight=`{float(args.static_prior_weight):.4g}`",
         "",
@@ -1402,6 +2022,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adaptive-feedback-max-weight", type=float, default=1.75, help="Maximum adaptive per-finger feedback multiplier.")
     parser.add_argument("--activation-preemphasis-gain", type=float, default=0.0, help="Optional rising-edge ctrl boost to compensate activation dynamics; accepted only if replay objective improves.")
     parser.add_argument("--activation-preemphasis-alphas", type=str, default="1.0", help="Comma-separated trial scales for activation pre-emphasis.")
+    parser.add_argument("--state-feedback-refine-iters", type=int, default=0, help="Accepted passes that re-solve controls along the actually simulated state path.")
+    parser.add_argument("--state-feedback-kp", type=float, default=0.0, help="Qpos tracking gain for state-feedback ctrl refinement.")
+    parser.add_argument("--state-feedback-kv", type=float, default=0.0, help="Qvel tracking gain for state-feedback ctrl refinement.")
+    parser.add_argument("--state-feedback-tau-clip", type=float, default=0.0, help="Elementwise clip for state-feedback tau assist.")
+    parser.add_argument("--state-feedback-gains", type=str, default="1.0", help="Comma-separated trust-region gains for state-feedback refinement.")
+    parser.add_argument("--ctrl-timing-refine-iters", type=int, default=0, help="Accepted passes that advance controls and add pre-emphasis to reduce qpos replay mismatch.")
+    parser.add_argument("--ctrl-timing-lead-frames", type=str, default="1,2", help="Comma-separated lead frame candidates for ctrl timing refinement.")
+    parser.add_argument("--ctrl-timing-blend-alphas", type=str, default="0.25,0.5", help="Comma-separated blend candidates between current and future controls.")
+    parser.add_argument("--ctrl-timing-preemphasis-gains", type=str, default="0.2,0.3", help="Comma-separated extra pre-emphasis gain candidates after timing lead.")
+    parser.add_argument("--ctrl-timing-objective-tolerance", type=float, default=0.0, help="Relative objective tolerance allowed when accepting lower-RMSE timing candidates.")
+    parser.add_argument("--ctrl-replay-boost-iters", type=int, default=0, help="Accepted post-process passes that boost finger flexor controls from observed replay qpos mismatch.")
+    parser.add_argument("--ctrl-replay-boost-gains", type=str, default="0.5,1.0", help="Comma-separated gain candidates for ctrl replay boost.")
+    parser.add_argument("--ctrl-replay-extensor-relief-gain", type=float, default=0.25, help="Fraction of flexor replay boost used to reduce antagonistic extensor controls.")
+    parser.add_argument("--validation-initial-act-mode", type=str, default="zero", choices=("zero", "ctrl0"), help="Initial muscle activation state for forward validation.")
+    parser.add_argument("--rollout-initial-act-mode", type=str, default="zero", choices=("zero", "ctrl0"), help="Initial muscle activation state for short-horizon rollout fitting.")
     parser.add_argument("--ctrl-lb", type=float, default=0.0, help="Lower bound for reference control.")
     parser.add_argument("--ctrl-ub", type=float, default=1.0, help="Upper bound for reference control.")
     parser.add_argument("--qp-reg", type=float, default=1e-3, help="Regularization for actuator-space solve.")
@@ -1419,6 +2054,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout-qpos-weight", type=float, default=1.0, help="Weight on rollout pose tracking error in short-horizon mode.")
     parser.add_argument("--rollout-qvel-weight", type=float, default=0.25, help="Weight on rollout velocity tracking error in short-horizon mode.")
     parser.add_argument("--rollout-final-qpos-weight", type=float, default=0.0, help="Extra final-posture qpos weight in short-horizon mode.")
+    parser.add_argument("--rollout-mismatch-feedback-gain", type=float, default=1.0, help="Gain for trying one-step qpos/qvel mismatch feedback candidates inside short-horizon rollout optimization.")
     parser.add_argument("--rollout-u-weight", type=float, default=0.01, help="Weight on control magnitude in short-horizon mode.")
     parser.add_argument("--rollout-delta-u-weight", type=float, default=0.10, help="Weight on control smoothness in short-horizon mode.")
     parser.add_argument("--rollout-prior-weight", type=float, default=0.10, help="Weight on staying close to the warm/static prior sequence in short-horizon mode.")

@@ -15,8 +15,8 @@ import pandas as pd
 
 
 CLASS_DISPLAY = {
-    "within_reference": "Within reference",
-    "deviating": "Deviating",
+    "within_reference": "Sesuai Pola Acuan",
+    "deviating": "Pola Aktivitas Berbeda",
 }
 
 
@@ -186,7 +186,7 @@ def _write_notes(
         "",
         "## F1 Figure",
         f"- Validation macro F1 at best epoch: {float(best_row['val_macro_f1']):.4f}.",
-        f"- Validation deviating F1 at best epoch: {float(best_row['val_binary_f1_deviating']):.4f}.",
+        f"- Validation different-pattern F1 at best epoch: {float(best_row['val_binary_f1_deviating']):.4f}.",
         "- This figure focuses on class-balance-sensitive metrics rather than raw accuracy.",
         "",
         "## Loss Figure",
@@ -197,8 +197,8 @@ def _write_notes(
         "## Confusion Matrix",
         f"- Holdout accuracy: {float(test.get('accuracy', 0.0)):.4f}.",
         f"- Holdout macro F1: {float(test.get('macro_f1', 0.0)):.4f}.",
-        f"- Deviating recall is {float(test.get('recall_deviating', 0.0)):.4f}, indicating the model catches most deviating nodes.",
-        f"- Deviating precision is {float(test.get('precision_deviating', 0.0)):.4f}, so false positives remain an important limitation.",
+        f"- Different-pattern recall is {float(test.get('recall_deviating', 0.0)):.4f}.",
+        f"- Different-pattern precision is {float(test.get('precision_deviating', 0.0)):.4f}, so false positives remain an important limitation.",
         "",
         "## Generated Figures",
     ]
@@ -294,7 +294,7 @@ def main() -> int:
         y_lim=(0.0, 1.0),
         series=[
             ("val_macro_f1", "Validation macro F1", "#059669"),
-            ("val_binary_f1_deviating", "Validation deviating F1", "#7c3aed"),
+            ("val_binary_f1_deviating", "Validation different-pattern F1", "#7c3aed"),
         ],
         best_epoch=best_epoch,
         best_epoch_note=best_epoch_note,

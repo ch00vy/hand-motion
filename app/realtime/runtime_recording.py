@@ -10,8 +10,8 @@ from typing import Any
 
 import numpy as np
 
-from node_features import NODE_TEMPORAL_FEATURE_NAMES
-from phase_segmentation import VALID_PHASE_SEGMENTATION_STRATEGIES, segment_motion_phases
+from app.features.node_features import NODE_TEMPORAL_FEATURE_NAMES
+from app.features.phase_segmentation import VALID_PHASE_SEGMENTATION_STRATEGIES, segment_motion_phases
 
 try:
     import torch

@@ -165,6 +165,13 @@ def predict_temporal_gcn_for_trial(trial: dict[str, Any], checkpoint: dict[str, 
         x_seq = np.concatenate([x_seq, progress], axis=2).astype(np.float32)
     feature_mean = np.asarray(checkpoint["feature_mean"], dtype=np.float32).reshape(1, 1, -1)
     feature_std = np.asarray(checkpoint["feature_std"], dtype=np.float32).reshape(1, 1, -1)
+    if int(x_seq.shape[-1]) != int(feature_mean.shape[-1]):
+        feature_mode = str((trial.get("metadata") or {}).get("node_feature_mode") or "unknown")
+        raise ValueError(
+            f"Graph feature dimension {int(x_seq.shape[-1])} does not match checkpoint dimension "
+            f"{int(feature_mean.shape[-1])}. node_feature_mode={feature_mode}. "
+            "Use a checkpoint trained with the same node feature contract."
+        )
     x_std = (x_seq - feature_mean) / np.where(feature_std > 1e-8, feature_std, 1.0)
     adjacency = build_adjacency_matrix(trial)
     adjacency_seq = dynamic_adjacency_seq(trial)

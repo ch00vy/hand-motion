@@ -62,6 +62,7 @@ def save_trial(
     qpos: np.ndarray,
     subject_id: str,
     motion_type: str = "open_to_fist",
+    trial_label: str = "normal",
     dt: float = 1.0 / 60.0,
     records_root: Path = DEFAULT_RECORDS_ROOT,
     source_mode: str = "gui",
@@ -74,8 +75,11 @@ def save_trial(
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     subject_slug = _safe_slug(subject_id, "subject_unknown")
     motion_slug = _safe_slug(motion_type, "open_to_fist")
+    label_slug = _safe_slug(trial_label, "normal").lower()
+    if label_slug not in {"normal", "abnormal", "testing"}:
+        label_slug = "normal"
     trial_id = f"{stamp}_{motion_slug}"
-    trial_dir = Path(records_root).resolve() / subject_slug / trial_id
+    trial_dir = Path(records_root).resolve() / label_slug / subject_slug / trial_id
     trial_dir.mkdir(parents=True, exist_ok=True)
 
     frame_count = int(qpos_arr.shape[0])
@@ -84,6 +88,8 @@ def save_trial(
         "t": np.arange(frame_count, dtype=float) * float(dt),
         "progress_percent": np.linspace(0.0, 100.0, frame_count, dtype=float),
         "subject_id": [subject_slug] * frame_count,
+        "trial_label": [label_slug] * frame_count,
+        "label": [label_slug] * frame_count,
         "trial_id": [trial_id] * frame_count,
         "exercise_name": [motion_slug] * frame_count,
         "motion_type": [motion_slug] * frame_count,
@@ -96,6 +102,8 @@ def save_trial(
     meta = {
         "trial_id": trial_id,
         "subject_id": subject_slug,
+        "trial_label": label_slug,
+        "label": label_slug,
         "motion_type": motion_slug,
         "exercise_name": motion_slug,
         "num_frames": frame_count,
@@ -139,8 +147,15 @@ def load_trial(path: Union[str, Path]) -> TrialData:
         values = [str(item).strip() for item in df[column].dropna().tolist() if str(item).strip()]
         return values[0] if values else ""
 
+    inferred_label = "normal"
+    inferred_subject = trial_dir.parent.name
+    if trial_dir.parent.parent.name in {"normal", "abnormal", "testing"}:
+        inferred_label = trial_dir.parent.parent.name
+        inferred_subject = trial_dir.parent.name
     meta.setdefault("trial_id", first_string("trial_id") or trial_dir.name)
-    meta.setdefault("subject_id", first_string("subject_id") or trial_dir.parent.name)
+    meta.setdefault("subject_id", first_string("subject_id") or inferred_subject)
+    meta.setdefault("trial_label", first_string("trial_label") or first_string("label") or inferred_label)
+    meta.setdefault("label", meta["trial_label"])
     meta.setdefault("motion_type", first_string("motion_type") or first_string("exercise_name") or "open_to_fist")
     meta.setdefault("exercise_name", meta["motion_type"])
     meta.setdefault("num_frames", int(qpos.shape[0]))

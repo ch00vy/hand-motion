@@ -1,3 +1,4 @@
+
 # Hand Motion Biomechanical Analysis Tool
 
 Trial-based hand motion analysis system for:
@@ -6,9 +7,9 @@ Trial-based hand motion analysis system for:
 - replaying recorded kinematics in MuJoCo/MyoSuite,
 - estimating biomechanical muscle control references offline,
 - building graph sequences over muscle/actuator nodes,
-- running binary GCN node deviation classification.
+- running binary GCN node-level muscle activity-pattern classification.
 
-The current stable scope is **trial-based analysis**, not live diagnosis.
+The current stable scope is **trial-based musculoskeletal simulation analysis**, not live medical assessment.
 
 ## Final System Flow
 
@@ -30,7 +31,7 @@ recorded qpos
 -> ctrl_ref
 -> open_to_fist graph sequence
 -> normal reference sequence
--> binary GCN node deviation classifier
+-> binary GCN node activity-pattern classifier
 ```
 
 ### Output Labels
@@ -39,6 +40,11 @@ The active classifier is binary:
 
 - `within_reference`
 - `deviating`
+
+Display labels used in the GUI:
+
+- `within_reference` -> `Sesuai Pola Acuan`
+- `deviating` -> `Pola Aktivitas Berbeda`
 
 Multiclass labels are still experimental and are not the main workflow.
 
@@ -59,6 +65,19 @@ Ultraleap SDK, local records, generated artifacts, and model checkpoints are int
 ```powershell
 .\venv\Scripts\python.exe -m scripts.gui.run_trial_replay_and_classifier_gui
 ```
+
+## Run Simple Smart Glove GUI
+
+Use the compact connection and MuJoCo live-preview window:
+
+```powershell
+.\venv\Scripts\python.exe -m scripts.gui.run_smart_glove_gui
+```
+
+Enter the smart glove UDP host and port, then click **Connect**. The default
+port is `14043`. Configure Rokoko Studio Custom Streaming as `JSON v3` and
+send it to the same host and port. The GUI maps Rokoko hand bones to 23 qpos
+values and the MuJoCo viewer follows the incoming glove motion in realtime.
 
 If using a newly trained model/reference, set:
 
@@ -118,9 +137,10 @@ To regenerate figures from an existing completed run without retraining:
 .\venv\Scripts\python.exe scripts\offline_biomech\run_retrain_with_gui_records.py --stage figures_only
 ```
 
-## Add Abnormal Validation Records
+## Add Pattern-Different Validation Records
 
-User-declared abnormal records must be kept out of the normal reference pool. Stage them separately:
+User-declared pattern-different validation records must be kept out of the normal reference pool. Stage them separately.
+The command names still use `abnormal` for backward compatibility:
 
 ```powershell
 .\venv\Scripts\python.exe scripts\offline_biomech\run_retrain_with_gui_records.py --stage prepare_abnormal --abnormal-date-prefix 20260604_ --clean-prepare
@@ -132,19 +152,19 @@ Build their biomechanical `ctrl_ref`:
 .\venv\Scripts\python.exe scripts\offline_biomech\run_retrain_with_gui_records.py --stage ctrl_ref_abnormal --abnormal-date-prefix 20260604_ --clean-ctrl-ref
 ```
 
-After the normal model/reference already exists, build abnormal graph validation and evaluate the final binary GCN:
+After the normal model/reference already exists, build pattern-different graph validation and evaluate the final binary GCN:
 
 ```powershell
 .\venv\Scripts\python.exe scripts\offline_biomech\run_retrain_with_gui_records.py --stage all_abnormal_after_ctrl_ref --abnormal-date-prefix 20260604_ --clean-graph
 ```
 
-One-shot full retrain plus abnormal validation:
+One-shot full retrain plus pattern-different validation:
 
 ```powershell
 .\venv\Scripts\python.exe scripts\offline_biomech\run_retrain_with_gui_records.py --stage all_combined_with_abnormal_validation --date-prefix 20260603_ --abnormal-date-prefix 20260604_ --clean-prepare --clean-ctrl-ref --clean-graph --clean-reference
 ```
 
-Abnormal validation output:
+Pattern-different validation output:
 
 ```text
 artifacts/retrain_gui_plus_previous/abnormal_validation_eval/

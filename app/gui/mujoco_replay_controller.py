@@ -1,18 +1,49 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 import time
 from typing import Any, Optional
 
 import numpy as np
 
-from app.gui.realtime_pd_ctrl import RealtimePDDynamicCtrlEstimator
+from app.env_setup import configure_git_executable
+from app.estimation import RealtimePDDynamicCtrlEstimator
 from app.gui.replay_mode import ReplayMode
 from app.gui.trial_loader import TrialData
 
 
 DEFAULT_MYOSUITE_ENV_ID = "myoHandPoseRandom-v0"
 CTRL_VISUAL_SLIDER_DEADBAND = 1e-5
+
+
+class _MyoSuiteSimulationCompat:
+    """Expose the legacy ``sim`` API used by this controller."""
+
+    def __init__(self, env: Any):
+        self._env = env
+
+    @property
+    def model(self) -> Any:
+        return getattr(self._env, "mj_model")
+
+    @property
+    def data(self) -> Any:
+        return getattr(self._env, "mj_data")
+
+    @property
+    def renderer(self) -> Any:
+        return getattr(self._env, "mj_renderer", None)
+
+    def forward(self) -> None:
+        import mujoco
+
+        mujoco.mj_forward(self.model, self.data)
+
+    def advance(self) -> None:
+        import mujoco
+
+        mujoco.mj_step(self.model, self.data)
 
 
 @dataclass
@@ -44,14 +75,17 @@ class MujocoReplayController:
         env_id: str = DEFAULT_MYOSUITE_ENV_ID,
         hide_visual_markers: bool = True,
         use_ctrl_estimate_preview: bool = True,
-        ctrl_preview_mode: str = "legacy_solver",
+        ctrl_preview_mode: str = "pd_dynamic",
         ctrl_visual_deadband: float = CTRL_VISUAL_SLIDER_DEADBAND,
+        preserve_viewer_layer_toggles: bool = True,
     ):
         self.env_id = str(env_id)
         self.hide_visual_markers = bool(hide_visual_markers)
         self.use_ctrl_estimate_preview = bool(use_ctrl_estimate_preview)
-        self.ctrl_preview_mode = str(ctrl_preview_mode or "legacy_solver").strip().lower()
+        env_ctrl_mode = str(os.environ.get("HAND_CTRL_PREVIEW_MODE", "")).strip().lower()
+        self.ctrl_preview_mode = str(env_ctrl_mode or ctrl_preview_mode or "pd_dynamic").strip().lower()
         self.ctrl_visual_deadband = max(0.0, float(ctrl_visual_deadband))
+        self.preserve_viewer_layer_toggles = bool(preserve_viewer_layer_toggles)
         self.env: Optional[Any] = None
         self.controller_context: Optional[dict[str, Any]] = None
         self.pd_ctrl_estimator: Optional[RealtimePDDynamicCtrlEstimator] = None
@@ -164,6 +198,7 @@ class MujocoReplayController:
         if self.env is not None:
             return True
         try:
+            configure_git_executable()
             from myosuite.utils import gym
         except Exception as exc:
             self.message = f"MyoSuite unavailable: {type(exc).__name__}: {exc}"
@@ -176,6 +211,8 @@ class MujocoReplayController:
                 self.env = self.env.unwrapped
             except Exception:
                 pass
+            if not hasattr(self.env, "sim") and hasattr(self.env, "mj_model") and hasattr(self.env, "mj_data"):
+                self.env.sim = _MyoSuiteSimulationCompat(self.env)
             self._configure_clean_viewer()
             self.message = f"MyoSuite env ready: {self.env_id}"
             return True
@@ -216,26 +253,28 @@ class MujocoReplayController:
         except Exception as exc:
             self.message = f"Kinematic replay render failed: {type(exc).__name__}: {exc}"
 
-    def render_qpos(self, qpos: np.ndarray, *, message: str = "Live recording preview") -> None:
+    def render_qpos(self, qpos: np.ndarray, *, message: str = "Live recording preview") -> bool:
         if not self.ensure_env():
-            return
+            return False
         now = time.perf_counter()
         if (now - self._last_render_error_time) < self.render_error_cooldown_seconds:
-            return
+            return False
         try:
             qpos_arr = np.asarray(qpos, dtype=float).reshape(-1)
             if self.use_ctrl_estimate_preview:
                 rendered = self._apply_qpos_with_ctrl_display_and_render(qpos_arr, force=False)
                 if rendered:
                     self.message = self._format_internal_response_message(message)
-                    return
+                    return True
             rendered = self._apply_qpos_and_render(qpos_arr, force=False)
             if not rendered:
-                return
+                return False
             self.message = f"{message} | qpos-direct fallback"
+            return True
         except Exception as exc:
             self._last_render_error_time = time.perf_counter()
             self.message = f"Live preview render failed: {type(exc).__name__}: {exc}"
+            return False
 
     def _trial_dt(self) -> float:
         if self.trial is None:
@@ -274,7 +313,7 @@ class MujocoReplayController:
             return 1
         return max(1, int(round(float(self.control_dt) / timestep)))
 
-    def _reset_to_trial_initial_qpos(self) -> None:
+    def _reset_to_trial_initial_qpos(self, *, ctrl0: np.ndarray | None = None) -> None:
         if self.trial is None or self.env is None:
             return
         data = self.env.sim.data
@@ -287,8 +326,16 @@ class MujocoReplayController:
         if hasattr(data, "qacc"):
             data.qacc[:] = 0.0
         data.ctrl[:] = 0.0
+        if ctrl0 is not None:
+            ctrl_arr = self._clean_ctrl_for_viewer(np.asarray(ctrl0, dtype=float).reshape(-1))
+            data.ctrl[: min(len(ctrl_arr), int(data.ctrl.shape[0]))] = ctrl_arr[: min(len(ctrl_arr), int(data.ctrl.shape[0]))]
         if hasattr(data, "act") and len(data.act) > 0:
             data.act[:] = 0.0
+            if ctrl0 is not None:
+                ctrl_arr = self._clean_ctrl_for_viewer(np.asarray(ctrl0, dtype=float).reshape(-1))
+                n = min(int(len(data.act)), int(ctrl_arr.shape[0]))
+                if n > 0:
+                    data.act[:n] = np.clip(ctrl_arr[:n], 0.0, 1.0)
         self.env.sim.forward()
 
     def _advance_with_ctrl(self, ctrl_vec: np.ndarray) -> None:
@@ -327,7 +374,8 @@ class MujocoReplayController:
             target_index = int(np.clip(self.frame_index, 0, max(0, frame_count - 1)))
             current_sim_index = self._control_sim_frame_index
             if current_sim_index is None or target_index < current_sim_index:
-                self._reset_to_trial_initial_qpos()
+                ctrl0 = ctrl_seq[0] if ctrl_seq.shape[0] else None
+                self._reset_to_trial_initial_qpos(ctrl0=ctrl0)
                 current_sim_index = 0
             else:
                 current_sim_index = int(current_sim_index)
@@ -386,7 +434,8 @@ class MujocoReplayController:
             method_name = str(self.last_ctrl_summary.get("method", "")).strip()
             if method_name:
                 method = f" method={method_name}"
-        return f"{prefix} | muscle ctrl{method} active={active} max={max_ctrl:.2f} mean={mean_ctrl:.3f}"
+        mode = f" preview={self.ctrl_preview_mode}"
+        return f"{prefix} | muscle ctrl{method}{mode} active={active} max={max_ctrl:.2f} mean={mean_ctrl:.3f}"
 
     def _ensure_ctrl_estimator(self) -> bool:
         if self.ctrl_preview_mode == "pd_dynamic":
@@ -548,7 +597,8 @@ class MujocoReplayController:
         try:
             renderer = getattr(self.env.sim, "renderer", None)
             if renderer is not None and hasattr(renderer, "set_viewer_settings"):
-                renderer.set_viewer_settings(render_tendon=True, render_actuator=True)
+                if not self.preserve_viewer_layer_toggles:
+                    renderer.set_viewer_settings(render_tendon=True, render_actuator=True)
                 self._apply_clean_viewer_options(renderer)
         except Exception:
             pass
@@ -570,6 +620,8 @@ class MujocoReplayController:
         for option in options:
             if hasattr(option, "sitegroup"):
                 option.sitegroup[:] = 0
+            if self.preserve_viewer_layer_toggles:
+                continue
             if mujoco is not None and hasattr(option, "flags"):
                 option.flags[int(mujoco.mjtVisFlag.mjVIS_TENDON)] = True
                 option.flags[int(mujoco.mjtVisFlag.mjVIS_ACTUATOR)] = True
@@ -669,10 +721,11 @@ class MujocoReplayController:
 
     def play(self) -> None:
         if self.trial is None:
+            self.message = "Load or record a trial before playback."
             return
         if self.replay_mode == ReplayMode.NONE:
-            if not self.replay_kinematics():
-                return
+            self.message = "Select Load QPOS Replay or Load CTRL Replay before pressing Play."
+            return
         elif self.env is None:
             self.render_current()
         self.playing = True

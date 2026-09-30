@@ -137,7 +137,7 @@ def fig2_overall_framework() -> None:
         "Consistency\nvalidation\n(control replay)",
         "Temporal\nbiomechanical\ngraph",
         "Dynamic\nTemporal GCN",
-        "Node weakness\nindication",
+        "Muscle activity\npattern indication",
     ]
     colors = ["#EFF6FF", "#F8FAFC", "#ECFDF5", "#FFF7ED", "#FEF2F2", "#F0F9FF", "#EEF2FF", "#F0FDF4"]
     x_positions = np.linspace(0.4, 11.2, len(labels))
@@ -146,7 +146,7 @@ def fig2_overall_framework() -> None:
         if i < len(labels) - 1:
             arrow(ax, (x + 1.25, 2.65), (x_positions[i + 1], 2.65), color=GRAY)
     ax.text(6.6, 0.75, "Output: binary node-level labels for muscle/actuator nodes", ha="center", color=TEXT, fontsize=10)
-    ax.text(6.6, 0.35, "within_reference   |   deviating", ha="center", color=RED, fontsize=10, fontweight="bold")
+    ax.text(6.6, 0.35, "Sesuai Pola Acuan   |   Pola Aktivitas Berbeda", ha="center", color=RED, fontsize=10, fontweight="bold")
     save(fig, "fig2_overall_framework.png")
 
 
@@ -184,7 +184,7 @@ def fig4_graph_and_dynamic_temporal_gcn() -> None:
     ax.set_xlim(0, 12)
     ax.set_ylim(0, 6)
     ax.axis("off")
-    ax.set_title("Dynamic Temporal GCN for Muscle-Node Deviation Analysis", loc="left", fontweight="bold")
+    ax.set_title("Dynamic Temporal GCN for Muscle Activity-Pattern Analysis", loc="left", fontweight="bold")
 
     # Graph at a time step.
     center = np.array([2.1, 3.2])
@@ -210,7 +210,7 @@ def fig4_graph_and_dynamic_temporal_gcn() -> None:
 
     box(ax, (6.75, 2.35), (2.25, 1.65), "Dynamic Temporal GCN\n\nNode features +\nedge_weight_seq[t]\nGRU + attention pooling", fc="#EEF2FF", ec="#A5B4FC", fontsize=9)
     arrow(ax, (9.0, 3.2), (9.75, 3.2), color=BLUE)
-    box(ax, (9.75, 2.55), (1.65, 1.25), "Node output\n\nwithin_reference\ndeviating", fc="#F0FDF4", ec="#86EFAC", fontsize=9)
+    box(ax, (9.75, 2.55), (1.65, 1.25), "Node output\n\nSesuai Pola Acuan\nPola Aktivitas Berbeda", fc="#F0FDF4", ec="#86EFAC", fontsize=9)
     ax.text(6.0, 5.1, "Nodes = muscles / actuators", ha="center", fontsize=10, color=TEXT)
     ax.text(6.0, 4.75, "Edges = synergist, antagonist, and dynamic co-activation relations", ha="center", fontsize=9, color=GRAY)
     save(fig, "fig4_graph_and_dynamic_temporal_gcn.png")
@@ -304,7 +304,7 @@ def fig5_refinement_improvement() -> None:
 def fig6_confusion_matrix() -> None:
     eval_data = read_eval()
     cm = np.asarray(eval_data["test"]["confusion_matrix"], dtype=float)
-    labels = ["within_reference", "deviating"]
+    labels = ["Sesuai Pola Acuan", "Pola Aktivitas Berbeda"]
     row_sum = np.maximum(cm.sum(axis=1, keepdims=True), 1)
     norm = cm / row_sum
     fig, ax = plt.subplots(figsize=(5.5, 4.8))
@@ -357,7 +357,7 @@ def fig7_8_9_curves() -> None:
     plot_curve(
         "fig8_f1_curve.png",
         "Dynamic Temporal GCN F1 Curve",
-        [("train_macro_f1", "Training macro F1", BLUE), ("val_macro_f1", "Validation macro F1", ORANGE), ("val_binary_f1_deviating", "Validation deviating F1", RED)],
+        [("train_macro_f1", "Training macro F1", BLUE), ("val_macro_f1", "Validation macro F1", ORANGE), ("val_binary_f1_deviating", "Validation different-pattern F1", RED)],
         "F1 score",
         (0.70, 0.93),
     )

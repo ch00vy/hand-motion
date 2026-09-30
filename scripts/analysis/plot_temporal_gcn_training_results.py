@@ -15,8 +15,8 @@ import pandas as pd
 
 
 CLASS_DISPLAY = {
-    "within_reference": "Within reference",
-    "deviating": "Deviating",
+    "within_reference": "Sesuai Pola Acuan",
+    "deviating": "Pola Aktivitas Berbeda",
 }
 
 
@@ -165,12 +165,12 @@ def _write_summary(
         "## Test Metrics",
         f"- Accuracy: {float(test.get('accuracy', 0.0)):.4f}",
         f"- Macro F1: {float(test.get('macro_f1', 0.0)):.4f}",
-        f"- Deviating F1: {float(test.get('binary_f1_deviating', 0.0)):.4f}",
+        f"- Pola Aktivitas Berbeda F1: {float(test.get('binary_f1_deviating', 0.0)):.4f}",
         "",
-        "## Abnormal Validation Metrics",
+        "## Pattern-Different Validation Metrics",
         f"- Accuracy: {float(abnormal.get('accuracy', 0.0)):.4f}",
         f"- Macro F1: {float(abnormal.get('macro_f1', 0.0)):.4f}",
-        f"- Deviating F1: {float(abnormal.get('binary_f1_deviating', 0.0)):.4f}",
+        f"- Pola Aktivitas Berbeda F1: {float(abnormal.get('binary_f1_deviating', 0.0)):.4f}",
         "",
         "## Generated Figures",
     ]
@@ -239,7 +239,7 @@ def main() -> int:
         ylabel="F1 score",
         series=[
             ("val_macro_f1", "Validation macro F1", "#16a34a"),
-            ("val_binary_f1_deviating", "Validation deviating F1", "#dc2626"),
+            ("val_binary_f1_deviating", "Validation different-pattern F1", "#dc2626"),
         ],
         best_epoch=best_epoch,
         best_note=best_note,

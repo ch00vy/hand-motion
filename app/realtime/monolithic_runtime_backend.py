@@ -16,15 +16,20 @@ from typing import Any, Iterable
 
 import cv2
 import numpy as np
-import leap
 import pandas as pd
+
+try:
+    import leap
+except Exception:
+    leap = None
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from node_features import NODE_TEMPORAL_FEATURE_NAMES
-from phase_segmentation import VALID_PHASE_SEGMENTATION_STRATEGIES, segment_motion_phases
+from app.features.node_features import NODE_TEMPORAL_FEATURE_NAMES
+from app.features.phase_segmentation import VALID_PHASE_SEGMENTATION_STRATEGIES, segment_motion_phases
+from app.env_setup import configure_git_executable
 from app.realtime_graph import RealtimeGraphRuntime
 from app.realtime_runtime_support import (
     CTRL_ENV_SPEEDUP,
@@ -53,6 +58,7 @@ except ModuleNotFoundError:
     torch = None
 
 try:
+    configure_git_executable()
     from myosuite.utils import gym
 
     MYOSUITE_AVAILABLE = True
@@ -65,14 +71,25 @@ try:
 except ImportError as e:
     raise ImportError("mujoco package required") from e
 
-HAVE_OSQP = False
-try:
-    import osqp
-    import scipy.sparse as spa
+HAVE_OSQP = None
+osqp = None
+spa = None
 
-    HAVE_OSQP = True
-except Exception:
-    HAVE_OSQP = False
+
+def _ensure_osqp_available() -> bool:
+    global HAVE_OSQP, osqp, spa
+    if HAVE_OSQP is not None:
+        return bool(HAVE_OSQP)
+    try:
+        import osqp as _osqp
+        import scipy.sparse as _spa
+
+        osqp = _osqp
+        spa = _spa
+        HAVE_OSQP = True
+    except Exception:
+        HAVE_OSQP = False
+    return bool(HAVE_OSQP)
 
 
 class RollingRuntimeProfiler:
@@ -720,15 +737,54 @@ def estimate_ctrl_from_qpos(model, data, qpos_target, prev_ctrl=None, u_prior=No
         mujoco.mj_forward(m_raw, d_raw)
 
 
+class _NativeMujocoSimCompat:
+    """Expose the legacy ``env.sim`` surface on current MyoSuite environments.
+
+    MyoSuite 2.12+ environments expose native MuJoCo objects as ``mj_model``
+    and ``mj_data`` instead of the older dm-control-style ``sim`` object.
+    The rest of this project still deliberately uses the small legacy surface
+    (model, data, forward, advance), so adapt it in one place.
+    """
+
+    def __init__(self, model: Any, data: Any):
+        self.model = model
+        self.data = data
+
+    def forward(self) -> None:
+        mujoco.mj_forward(self.model, self.data)
+
+    def advance(self) -> None:
+        mujoco.mj_step(self.model, self.data)
+
+
 def create_probe_env(env_id: str = DEFAULT_MYOSUITE_ENV_ID):
-    """Create a MyoSuite env and return (env, model, data)."""
+    """Create a MyoSuite env and return (env, model, data).
+
+    Supports both legacy MyoSuite ``env.sim`` and current Gymnasium-backed
+    MyoSuite ``mj_model``/``mj_data`` APIs.
+    """
     env = gym.make(env_id)
     env.reset()
     try:
         env = env.unwrapped
     except Exception:
         pass
-    sim = env.sim
+    sim = getattr(env, "sim", None)
+    if sim is None:
+        model = getattr(env, "mj_model", None)
+        data = getattr(env, "mj_data", None)
+        if model is None or data is None:
+            raise RuntimeError(
+                "MyoSuite environment exposes neither legacy env.sim nor native mj_model/mj_data. "
+                f"Environment type: {type(env).__name__}"
+            )
+        sim = _NativeMujocoSimCompat(model, data)
+        try:
+            env.sim = sim
+        except Exception:
+            # Returning model/data still makes offline callers work if the
+            # environment disallows adding compatibility attributes.
+            pass
     return env, sim.model, sim.data
 
 # ---------------------------------------------------------------------------
@@ -863,7 +919,7 @@ def _solve_box_qp(P, q, lb, ub, x0, reg=OSQP_REG):
     n = P.shape[0]
     P = P + reg * np.eye(n)
 
-    if HAVE_OSQP:
+    if _ensure_osqp_available():
         P_sp = spa.csc_matrix(P)
         A = spa.eye(n, format="csc")
         m = osqp.OSQP()
@@ -896,15 +952,41 @@ def _solve_box_qp(P, q, lb, ub, x0, reg=OSQP_REG):
 
 
 def _dense_moment(model, data):
-    AM = np.zeros((model.nu, model.nv), dtype=float)
-    mujoco.mju_sparse2dense(
-        AM,
-        data.actuator_moment.reshape(-1),
-        data.moment_rownnz,
-        data.moment_rowadr,
-        data.moment_colind.reshape(-1),
-    )
-    return AM.T  # (nv, nu)
+    """Return actuator moment matrix as dense (nv, nu).
+
+    Some MuJoCo Python wheels expose actuator_moment as an already-dense array
+    and do not ship mju_sparse2dense. Keep this helper tolerant so inverse
+    dynamics and ctrl reference generation work across installed MuJoCo builds.
+    """
+
+    nu, nv = int(model.nu), int(model.nv)
+    dense_nu_nv = np.zeros((nu, nv), dtype=float)
+    sparse_to_dense = getattr(mujoco, "mju_sparse2dense", None)
+    if sparse_to_dense is not None:
+        try:
+            sparse_to_dense(
+                dense_nu_nv,
+                data.actuator_moment.reshape(-1),
+                data.moment_rownnz,
+                data.moment_rowadr,
+                data.moment_colind.reshape(-1),
+            )
+            return dense_nu_nv.T  # (nv, nu)
+        except Exception:
+            pass
+
+    try:
+        actuator_moment = np.asarray(data.actuator_moment, dtype=float)
+    except Exception:
+        return dense_nu_nv.T
+    if actuator_moment.shape == (nu, nv):
+        return actuator_moment.T
+    if actuator_moment.shape == (nv, nu):
+        return actuator_moment
+    flat = actuator_moment.reshape(-1)
+    if flat.size == nu * nv:
+        return flat.reshape(nu, nv).T
+    return dense_nu_nv.T
 
 
 def _gain_bias(model, data_s1):
@@ -2689,14 +2771,7 @@ def create_muscle_model_context(env_id: str = DEFAULT_MYOSUITE_ENV_ID) -> Muscle
         for idx in range(int(model.nv))
     ]
 
-    moment_matrix = np.zeros((int(model.nu), int(model.nv)), dtype=float)
-    mujoco.mju_sparse2dense(
-        moment_matrix,
-        d_raw.actuator_moment.reshape(-1),
-        d_raw.moment_rownnz,
-        d_raw.moment_rowadr,
-        d_raw.moment_colind.reshape(-1),
-    )
+    moment_matrix = _dense_moment(m_raw, d_raw).T
     return MuscleModelContext(
         env_id=env_id,
         env=env,
@@ -4281,7 +4356,7 @@ class LeapToMyoSuiteMapper:
 # ---------------------------------------------------------------------------
 # Tracking Listener
 # ---------------------------------------------------------------------------
-class LeapDataListener(leap.Listener):
+class LeapDataListener(leap.Listener if leap is not None else object):
     def __init__(
         self,
         mapper,
@@ -4296,6 +4371,8 @@ class LeapDataListener(leap.Listener):
         track_reacquire_reset_seconds=0.35,
         min_reset_interval_seconds=0.75,
     ):
+        if leap is None:
+            raise RuntimeError("Python package 'leap' is not available. Use LeapC UDP publisher or install the legacy leap binding.")
         super().__init__()
         self.mapper = mapper
         self.canvas = canvas

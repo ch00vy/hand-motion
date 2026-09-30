@@ -232,7 +232,7 @@ def main() -> int:
             ("train_accuracy", "Train accuracy"),
             ("val_accuracy", "Validation accuracy"),
             ("val_macro_f1", "Validation macro F1"),
-            ("val_binary_f1_deviating", "Validation deviating F1"),
+            ("val_binary_f1_deviating", "Validation different-pattern F1"),
         ],
         warnings=warnings,
     ):

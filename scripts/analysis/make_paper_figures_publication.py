@@ -173,7 +173,7 @@ def fig2() -> None:
         ("Control replay\nconsistency\nvalidation", "#FEF2F2"),
         ("Temporal\nmuscle graph\nsequence", "#F0F9FF"),
         ("Dynamic\nTemporal GCN", "#EEF2FF"),
-        ("Node weakness\nindication", "#F0FDF4"),
+        ("Muscle activity\npattern indication", "#F0FDF4"),
     ]
     positions = [
         (0.35, 3.65),
@@ -198,7 +198,7 @@ def fig2() -> None:
     for (x0, y0), (x1, y1) in zip(positions[4:7], positions[5:8]):
         arrow(ax, x0, y0 + h / 2, x1 + w, y1 + h / 2, lw=0.9)
     rbox(ax, 1.75, 0.85, 4.9, 0.48, "Output: binary node-level labels for muscle / actuator nodes", fc="#FFFFFF", ec=LINE, fs=7.2)
-    ax.text(4.2, 0.45, "within_reference   |   deviating", ha="center", color=RED, fontsize=7.6, fontweight="bold")
+    ax.text(4.2, 0.45, "Sesuai Pola Acuan   |   Pola Aktivitas Berbeda", ha="center", color=RED, fontsize=7.6, fontweight="bold")
     save(fig, "fig2_overall_framework.png")
 
 
@@ -259,7 +259,7 @@ def fig4() -> None:
     arrow(ax, 5.95, 3.12, 6.72, 3.12, BLUE)
     rbox(ax, 6.72, 2.35, 2.2, 1.35, "Dynamic Temporal GCN\n\nGCN over edge_weight[t]\nGRU + attention pooling", fc="#EEF2FF", ec="#A5B4FC", fs=7.5)
     arrow(ax, 8.92, 3.12, 9.72, 3.12, BLUE)
-    rbox(ax, 9.72, 2.5, 1.75, 1.05, "node labels\n\nwithin_reference\ndeviating", fc="#F0FDF4", ec="#86EFAC", fs=7.5)
+    rbox(ax, 9.72, 2.5, 1.75, 1.05, "node labels\n\nSesuai Pola Acuan\nPola Aktivitas Berbeda", fc="#F0FDF4", ec="#86EFAC", fs=7.5)
     ax.text(6.0, 4.8, "Temporal input: node_feature_seq[t] + dynamic adjacency / edge weights", ha="center", fontsize=8, color=MUTED)
     save(fig, "fig4_graph_and_dynamic_temporal_gcn.png")
 
@@ -299,7 +299,7 @@ def fig5() -> None:
 
 def fig6() -> None:
     cm = np.asarray(eval_json()["test"]["confusion_matrix"], dtype=float)
-    labels = ["within\nreference", "deviating"]
+    labels = ["sesuai\npola acuan", "pola\nberbeda"]
     norm = cm / np.maximum(cm.sum(axis=1, keepdims=True), 1)
     fig, ax = plt.subplots(figsize=(3.7, 3.35))
     im = ax.imshow(norm, cmap="Blues", vmin=0, vmax=1)
@@ -345,7 +345,7 @@ def curves() -> None:
     curve(
         "fig8_f1_curve.png",
         "F1 score",
-        [("train_macro_f1", "train macro", BLUE, "-"), ("val_macro_f1", "validation macro", ORANGE, "-"), ("val_binary_f1_deviating", "validation deviating", RED, "--")],
+        [("train_macro_f1", "train macro", BLUE, "-"), ("val_macro_f1", "validation macro", ORANGE, "-"), ("val_binary_f1_deviating", "validation different-pattern", RED, "--")],
         "F1 score",
         (0.74, 0.92),
     )

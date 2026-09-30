@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from app.gui.window_layout import LEAP_VIEWER
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -20,9 +21,24 @@ class LeapPreviewStatus:
 class LeapExternalPreviewController:
     """Manage the standalone Ultraleap tracking monitor process."""
 
-    def __init__(self, *, show_image: bool = False, scale: float = 1.6):
+    def __init__(
+        self,
+        *,
+        show_image: bool = False,
+        scale: float = 1.1,
+        window_name: str = "Ultraleap Tracking Preview",
+        window_x: int = LEAP_VIEWER.x,
+        window_y: int = LEAP_VIEWER.y,
+        window_width: int = LEAP_VIEWER.width,
+        window_height: int = LEAP_VIEWER.height,
+    ):
         self.show_image = bool(show_image)
         self.scale = float(scale)
+        self.window_name = str(window_name)
+        self.window_x = int(window_x)
+        self.window_y = int(window_y)
+        self.window_width = int(window_width)
+        self.window_height = int(window_height)
         self.process: Optional[subprocess.Popen] = None
         self.log_path = PROJECT_ROOT / "artifacts" / "gui_logs" / "leap_viewer.log"
         self._log_handle = None
@@ -45,7 +61,15 @@ class LeapExternalPreviewController:
             "--scale",
             str(self.scale),
             "--window-name",
-            "Ultraleap Tracking Preview",
+            self.window_name,
+            "--window-x",
+            str(self.window_x),
+            "--window-y",
+            str(self.window_y),
+            "--window-width",
+            str(self.window_width),
+            "--window-height",
+            str(self.window_height),
         ]
         if self.show_image:
             args.append("--show-image")

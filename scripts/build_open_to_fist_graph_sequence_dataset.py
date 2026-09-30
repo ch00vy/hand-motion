@@ -35,6 +35,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--edge-mode", type=str, default="dynamic_short_window", choices=("static", "dynamic_short_window"), help="Edge construction mode per window.")
     parser.add_argument("--edge-threshold", type=float, default=0.02, help="Absolute threshold applied to window edge weights.")
     parser.add_argument("--include-edge-sign", action="store_true", help="Keep antagonistic relations negative.")
+    parser.add_argument(
+        "--node-feature-mode",
+        type=str,
+        default="legacy_ctrl",
+        choices=("legacy_ctrl", "weakness_fusion"),
+        help="Node feature contract. Use weakness_fusion for PD indicator + inverse-dynamics effort + qpos motion features.",
+    )
     parser.add_argument("--transition-segmentation", type=str, default="auto_motion", choices=("none", "auto_motion"), help="Optional trim to isolate the transition region inside each trial.")
     parser.add_argument("--motion-threshold", type=float, default=0.12, help="Relative threshold used by auto_motion transition trimming.")
     parser.add_argument("--transition-pad-frames", type=int, default=2, help="Context frames kept before/after the detected motion region.")
@@ -76,6 +83,7 @@ def process_cohort(
             edge_threshold=float(args.edge_threshold),
             include_edge_sign=bool(args.include_edge_sign),
             cohort=str(cohort),
+            node_feature_mode=str(args.node_feature_mode),
         )
         saved = save_trial_graph_sequence(output_dir, sequence)
         records.append({"metadata": sequence["metadata"], **saved})
@@ -139,6 +147,7 @@ def main() -> int:
         "edge_mode": str(args.edge_mode),
         "edge_threshold": float(args.edge_threshold),
         "include_edge_sign": bool(args.include_edge_sign),
+        "node_feature_mode": str(args.node_feature_mode),
         "transition_segmentation": str(args.transition_segmentation),
         "motion_threshold": float(args.motion_threshold),
         "transition_pad_frames": int(args.transition_pad_frames),
