@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Mapping
 
 import numpy as np
+from app.realtime.rokoko_geometry import hand_basis
 
 
 ABDUCTION_QPOS_INDICES = (8, 12, 16, 20)
@@ -15,10 +16,10 @@ class FingerAbductionConfig:
     qpos_indices: tuple[int, int, int, int] = ABDUCTION_QPOS_INDICES
     signs: tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0)
     limits: tuple[tuple[float, float], ...] = (
-        (-0.7, 0.7),
-        (-0.7, 0.7),
-        (-0.7, 0.7),
-        (-0.7, 0.7),
+        (-0.261799, 0.261799),
+        (-0.261799, 0.261799),
+        (-0.261799, 0.261799),
+        (-0.261799, 0.261799),
     )
 
 
@@ -40,30 +41,21 @@ class RokokoFingerAbductionMapper:
         return vector / norm
 
     @classmethod
-    def _hand_basis(cls, points: Mapping[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-        wrist = points["wrist"]
-        finger_vectors = [points[f"{name}_proximal"] - wrist for name in FINGER_NAMES]
-        palm_axis = cls._unit(np.mean(finger_vectors, axis=0))
-        palm_normal = cls._unit(np.cross(finger_vectors[0], finger_vectors[-1]))
-        return palm_axis, palm_normal
-
-    @classmethod
     def _angles(cls, points: Mapping[str, np.ndarray]) -> np.ndarray:
-        wrist = points["wrist"]
-        palm_axis, palm_normal = cls._hand_basis(points)
+        basis = hand_basis(points)
         angles = []
         for name in FINGER_NAMES:
-            direction = cls._unit(points[f"{name}_proximal"] - wrist)
-            sine = float(np.dot(palm_normal, np.cross(palm_axis, direction)))
-            cosine = float(np.dot(palm_axis, direction))
-            angles.append(float(np.arctan2(sine, cosine)))
+            direction = basis.T @ cls._unit(points[f"{name}_medial"] - points[f"{name}_proximal"])
+            # Projection separates MCP spread from bending out of the palm plane.
+            angles.append(float(np.arctan2(direction[0], direction[1])))
         return np.asarray(angles, dtype=float)
 
     def map_points(self, points: Mapping[str, np.ndarray], *, calibrate: bool = False) -> np.ndarray:
         current = self._angles(points)
         if self._reference_angles is None or calibrate:
             self._reference_angles = current.copy()
-        mapped = (current - self._reference_angles) * np.asarray(self.config.signs, dtype=float)
+        delta = current - self._reference_angles
+        mapped = np.arctan2(np.sin(delta), np.cos(delta)) * np.asarray(self.config.signs, dtype=float)
         for index, (lower, upper) in enumerate(self.config.limits):
             mapped[index] = float(np.clip(mapped[index], lower, upper))
         return mapped

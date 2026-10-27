@@ -78,6 +78,41 @@ Enter the smart glove UDP host and port, then click **Connect**. The default
 port is `14043`. Configure Rokoko Studio Custom Streaming as `JSON v3` and
 send it to the same host and port. The GUI maps Rokoko hand bones to 23 qpos
 values and the MuJoCo viewer follows the incoming glove motion in realtime.
+With the glove streaming, hold the right hand open in the desired neutral pose
+and click **Calibrate Neutral**. That pose maps to zero qpos, matching the initial
+viewer preview. Wrist motion is measured relative to this pose in the calibrated
+palm frame and fitted to the MyoHand wrist hinge axes. Finger angles use the
+model's joint limits; a held pose remains live while packets keep arriving.
+**Calibrate Fist** is optional: while holding your maximum fist, click it to map
+the measured flexion range to the model's full flexion limits, so it changes
+motion amplitude. The status reports how many joints were calibrated. Joints
+with less than 0.05 rad of flexion change retain direct-angle mapping; do not
+assume those joints reached full range. Click **Calibrate Neutral** again to
+remove this scaling. Recalibrate after reconnecting or recalibrating in Studio.
+Calibration uses signed, unclipped finger-angle changes so an opposite MCP
+sign convention in the stream does not discard the four knuckle bends. The
+closed pose determines each calibrated joint's closing direction. If knuckle
+motion is too small to calibrate, the status identifies the affected fingers.
+
+For the initial live check, leave fist scaling off. Return to the calibration
+pose, then test wrist rotation, sideways deviation, wrist bending, individual
+finger bending, and finger spread separately. Compare direction and amplitude
+with Studio. Finger mapping, especially thumb opposition, remains a geometric
+approximation and requires validation against an actual stream. This mapping
+targets the first actor's right hand and assumes world-space positions and
+rightHand quaternion rotations use the same coordinate convention.
+
+The optional publisher uses the same mapper:
+
+```powershell
+.\venv\Scripts\python.exe -m scripts.realtime.rokoko_to_qpos_publisher
+```
+
+With this route, Studio sends JSON to port `14043` and the GUI receives qpos on
+port `15000`. The publisher captures its first valid pose as neutral; restart it
+while holding the desired neutral pose to recalibrate. GUI calibration buttons
+require direct Rokoko JSON. Run only one receiver on the Studio destination port
+(GUI, publisher, or JSON probe).
 
 If using a newly trained model/reference, set:
 

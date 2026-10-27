@@ -25,6 +25,7 @@ class SimpleSmartGloveApp(tk.Tk):
         self.viewer_var = tk.StringVar(value="MuJoCo viewer closed")
         self.packet_var = tk.StringVar(value="Packets: 0")
         self.qpos_var = tk.StringVar(value="QPOS: waiting for glove frames")
+        self.calibration_var = tk.StringVar(value="Calibration: capture neutral open hand. Fist scaling is optional.")
         self._provider: Optional[UdpQposProvider] = None
         self._packets_seen = 0
         self._last_qpos_sample_count = 0
@@ -62,6 +63,25 @@ class SimpleSmartGloveApp(tk.Tk):
         actions.columnconfigure((0, 1), weight=1)
         button(actions, "Connect", self.connect, variant="primary").grid(row=0, column=0, sticky="ew", padx=(0, 4))
         button(actions, "Disconnect", self.disconnect, variant="secondary").grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+        calibration = tk.Frame(left, bg=COLORS["panel"])
+        calibration.pack(fill=tk.X, pady=(4, 8))
+        calibration.columnconfigure((0, 1), weight=1)
+        button(calibration, "Calibrate Neutral", self.calibrate_open, variant="secondary").grid(
+            row=0, column=0, sticky="ew", padx=(0, 4)
+        )
+        button(calibration, "Calibrate Fist", self.calibrate_closed, variant="secondary").grid(
+            row=0, column=1, sticky="ew", padx=(4, 0)
+        )
+        tk.Label(
+            left,
+            textvariable=self.calibration_var,
+            bg=COLORS["panel"],
+            fg=COLORS["muted"],
+            font=FONTS["small"],
+            wraplength=260,
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, pady=(0, 8))
 
         self._status_row(left, "Status", self.status_var, 0)
         self._status_row(left, "Packets", self.packet_var, 1)
@@ -129,6 +149,24 @@ class SimpleSmartGloveApp(tk.Tk):
         self.status_var.set(f"Connected ({host}:{port})")
         self.viewer_var.set("MuJoCo viewer open | waiting for glove frames")
 
+    def calibrate_open(self) -> None:
+        if self._provider is None:
+            self.calibration_var.set("Connect to Rokoko before calibrating.")
+            return
+        success, message = self._provider.calibrate_rokoko_open()
+        self.calibration_var.set(message)
+        if success:
+            self._controller.render_qpos(self._provider.latest_qpos(), message="SMART_GLOVE NEUTRAL")
+
+    def calibrate_closed(self) -> None:
+        if self._provider is None:
+            self.calibration_var.set("Connect to Rokoko before calibrating.")
+            return
+        success, message = self._provider.calibrate_rokoko_closed()
+        self.calibration_var.set(message)
+        if success:
+            self._controller.render_qpos(self._provider.latest_qpos(), message="SMART_GLOVE FULL FIST")
+
     def disconnect(self, *, update_status: bool = True) -> None:
         if self._provider is not None:
             self._provider.close()
@@ -148,7 +186,7 @@ class SimpleSmartGloveApp(tk.Tk):
                 self.qpos_var.set(f"QPOS: live ({len(qpos)} joints)")
                 self.viewer_var.set("MuJoCo viewer open | smart glove live")
             elif provider_status.stuck:
-                self.qpos_var.set("QPOS: stale or unchanged")
+                self.qpos_var.set("QPOS: stream stale")
         self.after(33, self._tick)
 
     def _on_close(self) -> None:

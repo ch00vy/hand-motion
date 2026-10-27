@@ -12,87 +12,10 @@ from typing import Callable, Optional
 import numpy as np
 
 from app.gui.trial_loader import DEFAULT_RECORDS_ROOT, TrialData, save_trial
-from app.realtime.rokoko_finger_abduction import RokokoFingerAbductionMapper
-from app.realtime.rokoko_wrist_mapping import RokokoWristMapper
+from app.realtime.rokoko_mapping import RokokoHandMapper, hand_points as _rokoko_hand_points
 
 
 QposProvider = Callable[[], Optional[np.ndarray]]
-
-_ROKOKO_QPOS_SIZE = 23
-_ROKOKO_FINGER_LAYOUT = (
-    ("rightIndex", 7),
-    ("rightMiddle", 11),
-    ("rightRing", 15),
-    ("rightLittle", 19),
-)
-
-
-def _rokoko_position(node: dict[str, object]) -> np.ndarray:
-    value = node["position"]
-    return np.array([value["x"], value["y"], value["z"]], dtype=float)  # type: ignore[index]
-
-
-def _rokoko_angle_between(first: np.ndarray, second: np.ndarray) -> float:
-    first_norm = float(np.linalg.norm(first))
-    second_norm = float(np.linalg.norm(second))
-    if first_norm <= 1e-9 or second_norm <= 1e-9:
-        return 0.0
-    cosine = float(np.dot(first, second) / (first_norm * second_norm))
-    return float(math.acos(np.clip(cosine, -1.0, 1.0)))
-
-
-def _rokoko_hand_points(packet: dict[str, object]) -> dict[str, np.ndarray]:
-    scene = packet["scene"]
-    actors = scene["actors"]  # type: ignore[index]
-    body = actors[0]["body"]  # type: ignore[index]
-    right_hand = body["rightHand"]  # type: ignore[index]
-    points = {
-        "wrist": _rokoko_position(right_hand),
-        "wrist_rotation": RokokoWristMapper.quaternion_from_node(right_hand["rotation"]),  # type: ignore[index]
-    }
-    for prefix, rokoko_name in (
-        ("thumb", "rightThumb"),
-        ("index", "rightIndex"),
-        ("middle", "rightMiddle"),
-        ("ring", "rightRing"),
-        ("little", "rightLittle"),
-    ):
-        for segment in ("Proximal", "Medial", "Distal", "Tip"):
-            points[f"{prefix}_{segment.lower()}"] = _rokoko_position(body[f"{rokoko_name}{segment}"])  # type: ignore[index]
-    return points
-
-
-def _rokoko_finger_flexion(points: dict[str, np.ndarray], prefix: str) -> tuple[float, float, float]:
-    values = (
-        _rokoko_angle_between(points[f"{prefix}_proximal"] - points["wrist"], points[f"{prefix}_medial"] - points[f"{prefix}_proximal"]),
-        _rokoko_angle_between(points[f"{prefix}_medial"] - points[f"{prefix}_proximal"], points[f"{prefix}_distal"] - points[f"{prefix}_medial"]),
-        _rokoko_angle_between(points[f"{prefix}_distal"] - points[f"{prefix}_medial"], points[f"{prefix}_tip"] - points[f"{prefix}_distal"]),
-    )
-    clipped = [float(np.clip(value, 0.0, math.pi / 2.0)) for value in values]
-    return (clipped[0], clipped[1], clipped[2])
-
-
-def _rokoko_to_qpos(
-    points: dict[str, np.ndarray],
-    reference: Optional[dict[str, np.ndarray]],
-    wrist_mapper: Optional[RokokoWristMapper] = None,
-    abduction_mapper: Optional[RokokoFingerAbductionMapper] = None,
-) -> np.ndarray:
-    qpos = np.zeros(_ROKOKO_QPOS_SIZE, dtype=float)
-    for prefix, base in _ROKOKO_FINGER_LAYOUT:
-        name = prefix.removeprefix("right").lower()
-        current = _rokoko_finger_flexion(points, name)
-        baseline = _rokoko_finger_flexion(reference, name) if reference is not None else (0.0, 0.0, 0.0)
-        values = tuple(max(0.0, value - base_value) for value, base_value in zip(current, baseline))
-        qpos[base], qpos[base + 2], qpos[base + 3] = values
-    current_thumb = _rokoko_finger_flexion(points, "thumb")
-    baseline_thumb = _rokoko_finger_flexion(reference, "thumb") if reference is not None else (0.0, 0.0, 0.0)
-    qpos[4:7] = [max(0.0, value - base_value) for value, base_value in zip(current_thumb, baseline_thumb)]
-    if wrist_mapper is not None:
-        qpos = wrist_mapper.map_into_qpos(qpos, points["wrist_rotation"])
-    if abduction_mapper is not None:
-        qpos = abduction_mapper.map_into_qpos(qpos, points)
-    return qpos
 
 
 @dataclass
@@ -674,11 +597,8 @@ class UdpQposProvider:
         self._last_qpos_delta_norm = 0.0
         self._samples_seen = 0
         self._last_sequence = -1
-        self._rokoko_reference: Optional[dict[str, np.ndarray]] = None
-        self._rokoko_wrist_mapper = RokokoWristMapper()
-        self._rokoko_abduction_mapper = RokokoFingerAbductionMapper()
-        self._rokoko_packets_seen = 0
-        self._stuck_after_seconds = 1.25
+        self._rokoko_mapper = RokokoHandMapper()
+        self._input_kind = ""
         self._change_epsilon = 1e-5
 
     def start(self) -> bool:
@@ -711,7 +631,7 @@ class UdpQposProvider:
             return
         while True:
             try:
-                payload, _addr = self.socket.recvfrom(16384)
+                payload, _addr = self.socket.recvfrom(65535)
             except BlockingIOError:
                 return
             except OSError:
@@ -724,30 +644,45 @@ class UdpQposProvider:
                     if values is None:
                         values = packet.get("joint_angles", packet.get("angles"))
                     qpos = np.asarray(values, dtype=float).reshape(-1)
+                    input_kind = "qpos"
                 elif isinstance(packet.get("scene"), dict):
                     points = _rokoko_hand_points(packet)
-                    if self._rokoko_reference is None:
-                        self._rokoko_reference = points
-                    qpos = _rokoko_to_qpos(
-                        points,
-                        self._rokoko_reference,
-                        self._rokoko_wrist_mapper,
-                        self._rokoko_abduction_mapper,
-                    )
-                    self._rokoko_packets_seen += 1
+                    qpos = self._rokoko_mapper.map_points(points)
+                    input_kind = "rokoko"
                 else:
                     continue
                 if qpos.size <= 0 or not np.all(np.isfinite(qpos)):
                     continue
-                if str(packet.get("units", "radians")).strip().lower() in {"degree", "degrees", "deg"}:
+                if packet_type in {"hand_qpos", "smart_glove", "glove_qpos"} and str(packet.get("units", "radians")).strip().lower() in {"degree", "degrees", "deg"}:
                     qpos = np.deg2rad(qpos)
                 arr = np.zeros((self.qpos_dim,), dtype=float)
                 width = min(int(qpos.size), self.qpos_dim)
                 arr[:width] = qpos[:width]
                 self._last_sequence = int(packet.get("seq", self._last_sequence))
                 self._register_qpos_sample(arr)
+                self._input_kind = input_kind
             except Exception:
                 continue
+
+    def calibrate_rokoko_open(self) -> tuple[bool, str]:
+        self._drain_socket()
+        if self._input_kind != "rokoko":
+            return False, "Kalibrasi GUI memerlukan JSON Rokoko langsung (port 14043)."
+        points = self._rokoko_mapper.latest_points
+        if points is None or time.perf_counter() - self._last_qpos_sample_time >= self.stale_after_seconds:
+            return False, "Pose Rokoko tidak tersedia atau stream terhenti."
+        neutral = self._rokoko_mapper.calibrate_open(points)
+        self._register_qpos_sample(neutral)
+        return True, "Pose netral tersimpan. Calibrate Fist opsional untuk penskalaan rentang."
+
+    def calibrate_rokoko_closed(self) -> tuple[bool, str]:
+        self._drain_socket()
+        if self._input_kind != "rokoko" or time.perf_counter() - self._last_qpos_sample_time >= self.stale_after_seconds:
+            return False, "Kalibrasi memerlukan stream JSON Rokoko langsung yang aktif."
+        success, message = self._rokoko_mapper.calibrate_closed()
+        if success:
+            self._register_qpos_sample(self._rokoko_mapper.map_points(self._rokoko_mapper.latest_points))
+        return success, message
 
     def _register_qpos_sample(self, qpos: np.ndarray) -> None:
         now = time.perf_counter()
@@ -771,15 +706,13 @@ class UdpQposProvider:
         latest_age = (now - self._last_qpos_sample_time) if self._last_qpos_sample_time > 0.0 else float("inf")
         unchanged = (now - self._last_qpos_change_time) if self._last_qpos_change_time > 0.0 else float("inf")
         stale = bool(self.available and has_qpos and latest_age >= self.stale_after_seconds)
-        stuck = bool(self.available and has_qpos and unchanged >= self._stuck_after_seconds)
+        # A held pose is valid live input; only missing packets are stale.
         if not self.available:
             message = self.message
         elif not has_qpos:
             message = f"UDP receiver active on {self.host}:{self.port}, waiting for Rokoko JSON v3 or qpos packets."
         elif stale:
             message = f"UDP qpos stale: no packet for {latest_age:.1f}s."
-        elif stuck:
-            message = f"QPOS STUCK: no mapped qpos change for {unchanged:.1f}s."
         else:
             message = f"UDP qpos live: dim={self._last_qpos.size} seq={self._last_sequence} delta={self._last_qpos_delta_norm:.5f}."
         return QposProviderStatus(
@@ -790,7 +723,7 @@ class UdpQposProvider:
             latest_age_seconds=float(latest_age),
             unchanged_seconds=float(unchanged),
             delta_norm=float(self._last_qpos_delta_norm),
-            stuck=bool(stuck or stale),
+            stuck=stale,
             message=message,
         )
 
@@ -806,9 +739,8 @@ class UdpQposProvider:
         self.socket = None
         self.available = False
         self._last_qpos = None
-        self._rokoko_reference = None
-        self._rokoko_wrist_mapper.reset()
-        self._rokoko_abduction_mapper.reset()
+        self._rokoko_mapper.reset()
+        self._input_kind = ""
         self._last_qpos_sample_time = 0.0
         self._last_qpos_change_time = 0.0
         self._last_qpos_delta_norm = 0.0
